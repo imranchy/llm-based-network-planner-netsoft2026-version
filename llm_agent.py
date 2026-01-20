@@ -1,3 +1,4 @@
+
 """llm_agent.py
 
 NetSoft 2026 edition (LLM-first analytics + optional RAG)
@@ -6,7 +7,7 @@ NetSoft 2026 edition (LLM-first analytics + optional RAG)
 This agent intentionally does NOT ask the LLM to emit Python function calls.
 Instead, it:
   1) Builds (or loads) a topology in Python (structure only)
-  2) Sends a JSON-friendly snapshot of the graph + optional RAG context
+  2) Sends a JSON-friendly snapshot of the graph + optional context
   3) Asks the LLM to compute analytics (paths, degrees, hop count, etc.)
   4) Parses ONE strict JSON object from the LLM
   5) Optionally renders a plot using the LLM's "plot" spec
@@ -29,15 +30,21 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+import ollama
 import pandas as pd
 import psutil
 import yaml
-import ollama
 
+from equipment_manager import EquipmentManager
 from graph_processor import NetworkGraph
 from qot_analyzer import QoTAnalyzer
-from equipment_manager import EquipmentManager
-from qot_utils import FIBER_REFERENCE
+
+# Fiber reference table (max values from the provided fiber table image).
+# Used to provide deterministic attenuation/delay constants to the LLM.
+try:
+    from qot_utils import FIBER_REFERENCE  # type: ignore
+except Exception:
+    FIBER_REFERENCE = {}
 
 
 # ------------------------------ Model registry ------------------------------
@@ -136,14 +143,12 @@ _DEF_SEED = 12345
 
 def _decode_options_for_mode(mode: str) -> dict:
     base = {"seed": _DEF_SEED, "top_p": 1.0}
-    # "none" means: no extra scaffolding other than schema rules
     if mode == "none":
         return {**base, "temperature": 0.2, "num_predict": 600}
     if mode == "zero-shot":
         return {**base, "temperature": 0.0, "num_predict": 520}
     if mode == "one-shot":
         return {**base, "temperature": 0.0, "num_predict": 700}
-    # few-shot
     return {**base, "temperature": 0.05, "num_predict": 800}
 
 
@@ -182,53 +187,12 @@ def read_cpu_usage():
         return None, None
 
 
-# ------------------------------ RAG (lightweight) ------------------------------
-def _load_rag_context(rag_enabled: bool) -> str:
-    """Simple RAG: return a context string.
-
-    We reuse equipment + QoT reference tables and any optional user notes in
-    ./rag_corpus/.
-    """
-    if not rag_enabled:
-        return ""
-
-    parts: List[str] = []
-    try:
-        eqp_mngr.deploy_equipment()
-        summary = eqp_mngr.summarize_equipment(visualize=False)
-        node_df = summary.get("node_df", pd.DataFrame())
-        link_df = summary.get("link_df", pd.DataFrame())
-        if isinstance(node_df, pd.DataFrame) and not node_df.empty:
-            parts.append("EQUIPMENT_NODE_TABLE\n" + node_df.to_csv(index=False))
-        if isinstance(link_df, pd.DataFrame) and not link_df.empty:
-            parts.append("EQUIPMENT_LINK_TABLE\n" + link_df.to_csv(index=False))
-    except Exception:
-        pass
-
-    corpus_dir = "rag_corpus"
-    if os.path.isdir(corpus_dir):
-        for fn in sorted(os.listdir(corpus_dir)):
-            if not fn.lower().endswith((".txt", ".md", ".csv")):
-                continue
-            fp = os.path.join(corpus_dir, fn)
-            try:
-                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                    parts.append(f"FILE:{fn}\n" + f.read())
-            except Exception:
-                continue
-
-    return "\n\n".join(parts)[:20000]
-
-
 # ------------------------------ JSON extraction ------------------------------
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _extract_first_json(text: str) -> Dict[str, Any]:
     """Extract and parse the first JSON object from a model reply."""
-    # Many models wrap JSON in fenced blocks (```json ... ```). We must NOT
-    # delete the contents (older regex approaches did), only remove the fence
-    # markers so the JSON remains extractable.
     cleaned = text.strip()
     cleaned = re.sub(r"```\s*(json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.replace("```", "")
@@ -249,14 +213,12 @@ def _json_sanitize(obj: Any) -> Any:
     if isinstance(obj, set):
         return [_json_sanitize(x) for x in sorted(obj, key=lambda x: str(x))]
 
-    # NetworkX views, dict views, pandas Index, etc.
     if hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes, bytearray)):
         try:
             return [_json_sanitize(x) for x in list(obj)]
         except Exception:
             pass
 
-    # numpy scalars
     try:
         import numpy as np
 
@@ -268,25 +230,129 @@ def _json_sanitize(obj: Any) -> Any:
     return obj
 
 
+# ------------------------------ Query intent helpers ------------------------------
+
+def _query_flags(q: str) -> Dict[str, bool]:
+    ql = (q or "").strip().lower()
+
+    scalar_hint = bool(re.search(r"\b(how many|total number of|total count|count of|number of)\b", ql))
+
+    viz_any = bool(
+        re.search(r"\b(plot|draw|visuali[sz]e|render|diagram|topology|graph|network)\b", ql)
+        or bool(re.search(r"\b(from csv|csv files?)\b", ql))
+    )
+
+    viz_full = bool(
+        re.search(r"\b(draw|plot|visuali[sz]e|render|create|show)\b.*\b(topology|graph|network)\b", ql)
+        or bool(re.search(r"\b(create|draw|plot|visuali[sz]e|render)\b.*\b(from csv|csv files?)\b", ql))
+    )
+
+    viz_path = bool(re.search(r"\b(show|draw|plot|visuali[sz]e)\b.*\b(shortest path|path)\b", ql))
+
+    random_gen = bool(re.search(r"\b(generate|create|make)\b.*\b(random)\b.*\b(topology|graph|network)\b", ql))
+
+    # If we generate a topology, we should also plot it by default.
+    if random_gen:
+        viz_any = True
+        viz_full = True
+
+    return {
+        "scalar_hint": scalar_hint,
+        "viz_any": viz_any,
+        "viz_full": viz_full,
+        "viz_path": viz_path,
+        "random_gen": random_gen,
+    }
+
+
+def _is_in_scope(q: str) -> bool:
+    """Cheap Python-side domain gate to prevent unrelated questions reaching the LLM."""
+    ql = (q or "").lower()
+
+    network_terms = [
+        "topology",
+        "graph",
+        "node",
+        "link",
+        "path",
+        "shortest",
+        "hop",
+        "degree",
+        "distance",
+        "equipment",
+        "roamd",
+        "roadm",
+        "amp",
+        "amplifier",
+        "pre-amp",
+        "preamp",
+        "booster",
+        "ila",
+        "attenuation",
+        "propagation",
+        "delay",
+        "qot",
+        "osnr",
+        "gsnr",
+        "snr",
+        "fiber",
+        "ssmf",
+        "hcf",
+        "csv",
+        "random topology",
+    ]
+
+    oos_terms = [
+        "holiday",
+        "vacation",
+        "travel",
+        "berlin",
+        "paris",
+        "london",
+        "make a cup of tea",
+        "recipe",
+        "cook",
+        "hotel",
+        "flight",
+        "restaurant",
+    ]
+
+    has_network = any(t in ql for t in network_terms)
+    has_oos = any(t in ql for t in oos_terms)
+
+    if has_oos and not has_network:
+        return False
+    if not has_network:
+        return False
+    return True
+
+
 # ------------------------------ Prompting ------------------------------
 _ONE_SHOT_EXAMPLE = {
-    "question": "Find the shortest path from M1 to M3",
+    "question": "Show the shortest path from M1 to M3 and plot it",
     "answer": {
-        "task": "shortest_path",
         "result": {"path": ["M1", "M2", "M3"], "total_distance_km": 123.4, "hop_count": 2},
-        "explanation": "Computed by enumerating simple paths and selecting minimum total distance.",
-        "plot": {"title": "Shortest path M1 to M3", "highlight_edges": [["M1", "M2"], ["M2", "M3"]]},
+        "plot": {
+            "title": "Shortest path M1 to M3",
+            "highlight_edges": [["M1", "M2"], ["M2", "M3"]],
+            "highlight_nodes": ["M1", "M2", "M3"],
+        },
     },
 }
 
 
 def build_messages(query: str, mode: str, rag_enabled: bool) -> List[Dict[str, str]]:
     topology = _json_sanitize(net.topology_snapshot())
-    rag = _load_rag_context(rag_enabled)
 
-    # If the user is asking about equipment/QoT, include authoritative equipment tables
-    # (computed by the hardcoded Python logic) to reduce hallucinations.
-    equip_hint = bool(re.search(r"\b(equipment|deploy|router|switch|amplifier|ila|qot|osnr|g?snr|ber|nf|gain)\b", query, re.IGNORECASE))
+    flags = _query_flags(query)
+
+    equip_hint = bool(
+        re.search(
+            r"\b(equipment|deploy|router|switch|amplifier|ila|qot|osnr|g?snr|ber|nf|gain|pre-amp|preamp|booster)\b",
+            query,
+            re.IGNORECASE,
+        )
+    )
     equip_tables_csv = None
     if equip_hint:
         try:
@@ -300,34 +366,69 @@ def build_messages(query: str, mode: str, rag_enabled: bool) -> List[Dict[str, s
             if isinstance(link_df, pd.DataFrame) and not link_df.empty:
                 parts.append("LINK_EQUIPMENT_TABLE_CSV\n" + link_df.to_csv(index=False))
             if parts:
-                equip_tables_csv = "\n\n".join(parts)
-                equip_tables_csv = equip_tables_csv[:12000]
+                equip_tables_csv = "\n\n".join(parts)[:12000]
         except Exception:
             equip_tables_csv = None
 
     schema_rules = (
-        "Return exactly ONE JSON object (no markdown, no code fences).\n"
-        "JSON keys allowed: task, result, tables, explanation, plot, warnings.\n"
-        "- task: short string describing what you did\n"
-        "- result: object with your computed numeric/structured answer. Include a human-readable 'summary' string when possible.\n"
-        "- tables: optional list of {name, rows} where rows is a list of objects\n"
-        "- plot: optional object with: title, highlight_edges, highlight_nodes, highlight_color\n"
-        "  * highlight_edges: either a list of [u,v] pairs OR the string 'ALL' to draw all edges\n"
-        "  * highlight_nodes: either a list of node ids OR the string 'ALL' to draw all nodes\n"
-        "  * If the user asks to plot/visualize the topology, prefer highlight_edges='ALL'\n"
+        "Return exactly ONE valid JSON object. No markdown, no code fences, no extra text.\n"
+        "Allowed top-level keys ONLY: result, tables, plot.\n"
+        "Do NOT include any other top-level keys.\n"
+        "Do NOT place 'plot' inside 'result'. 'plot' MUST be top-level.\n"
         "\n"
+        "DOMAIN SCOPE (HARD RULE):\n"
+        "You may ONLY answer questions about: optical network topology (nodes/links), graph metrics (paths, degrees, hops), "
+        "equipment deployment (from reference.equipment_tables_csv), and QoT (distance, attenuation, propagation delay).\n"
+        "If the user request is outside this scope (travel, food, general knowledge, etc.), return ONLY:\n"
+        '{ "result": { "error": "OUT_OF_SCOPE", "message": "Only optical network topology/equipment/QoT questions are supported." } }\n'
+        "\n"
+        "OUTPUT MINIMALITY (HARD RULE):\n"
+        "- If the user asks for a single scalar value (count/total/how many), return ONLY:\n"
+        '  { "result": { "value": <number> } }\n'
+        "  Do NOT include plot or tables.\n"
+        "- Do NOT add any commentary or summaries unless the user explicitly asks.\n"
+        "\n"
+        "RANDOM TOPOLOGY GENERATION (HARD RULE):\n"
+        "If the user asks to generate/create a random topology/graph/network, you MUST request a Python-side topology change by returning:\n"
+        '  { "result": { "topology_modifications": { "generate_random_topology": { ... } } }, "plot": { ... } }\n'
+        "The generate_random_topology object may include: network_type/kind, num_nodes/num_metro, avg_degree, min_distance_km, max_distance_km, seed.\n"
+        "When generating a random topology, also return a plot that draws the full topology (highlight_edges='ALL', highlight_nodes='ALL').\n"
+        "\n"
+        "PLOT CONTRACT (HARD RULE):\n"
+        "If the user asks to show/draw/plot/visualize/render/create a topology or graph, you MUST return a top-level 'plot' object.\n"
+        "The plot object MUST be small and MUST NOT contain 'data', 'nodes', 'edges', 'links', or any raw topology.\n"
+        "The ONLY allowed keys inside plot are:\n"
+        "  - title: string\n"
+        "  - highlight_edges: 'ALL' or true or list of [u, v] pairs\n"
+        "  - highlight_nodes: 'ALL' or true or list of node ids\n"
+        "  - highlight_color: optional string\n"
+        "\n"
+        "Plot behavior rules:\n"
+        "- For full-topology requests: set highlight_edges='ALL' and highlight_nodes='ALL'.\n"
+        "- For path requests (e.g., shortest path M1 to M3) when visualization is requested:\n"
+        "  * compute the path\n"
+        "  * set highlight_nodes to the path nodes\n"
+        "  * set highlight_edges to ONLY the consecutive edges along that path\n"
+        "  * do NOT use 'ALL'.\n"
+        "\n"
+        "GRAPH RULES:\n"
         "You MUST compute graph analytics yourself from the provided topology snapshot.\n"
-        "Do NOT ask Python/networkx to compute shortest paths, degrees, etc.\n"
-        "If asked about equipment deployment, do NOT invent. Use reference.equipment_tables_csv if present and return it as tables named 'node_equipment' and 'link_equipment'.\n"
-        "If asked about propagation delay and/or fiber attenuation, use reference.fiber_reference and compute: \n"
+        "Do NOT ask for Python/networkx.\n"
+        "\n"
+        "EQUIPMENT RULES:\n"
+        "If asked about equipment, do NOT invent. Use reference.equipment_tables_csv if present.\n"
+        "Return tables ONLY if explicitly requested.\n"
+        "\n"
+        "PROPAGATION/ATTENUATION RULES:\n"
+        "If asked about propagation delay and/or attenuation, use reference.fiber_reference.\n"
+        "Compute:\n"
         "  - total_distance_km = sum(edge.distance_km) along the chosen path\n"
         "  - propagation_delay_ms = total_distance_km * propagation_delay_ms_per_km\n"
         "  - attenuation_dB = total_distance_km * attenuation_dB_per_km\n"
-        "Return these in result when relevant (and include the path used).\n"
     )
 
-    # Expand fiber reference with ms/km for the LLM (deterministic arithmetic).
-    fiber_reference = {}
+    # Expand fiber reference with ms/km for deterministic arithmetic.
+    fiber_reference: Dict[str, Dict[str, float]] = {}
     try:
         for k, v in (FIBER_REFERENCE or {}).items():
             att = float(v.get("attenuation_dB_per_km"))
@@ -355,12 +456,22 @@ def build_messages(query: str, mode: str, rag_enabled: bool) -> List[Dict[str, s
             "link_id prefix ML/AL indicates link family.",
             "Fiber reference keys supported: ssmf, bend_insensitive_smf, hcf.",
             "If the user does not specify a fiber type, default to ssmf.",
-            "To answer delay/attenuation questions: pick a path, sum distances, then multiply by the per-km constants.",
         ],
     }
 
-    if rag:
-        user_payload["rag_context"] = rag
+    # Visualization notes
+    if flags["viz_full"]:
+        user_payload["notes"].append(
+            "Visualization requested: return top-level plot with highlight_edges='ALL' and highlight_nodes='ALL'."
+        )
+    if flags["viz_path"]:
+        user_payload["notes"].append(
+            "Visualization requested for a path: return top-level plot with highlight_nodes=path nodes and highlight_edges=only consecutive edges along that path (no ALL)."
+        )
+    if flags["random_gen"]:
+        user_payload["notes"].append(
+            "Random topology generation requested: include result.topology_modifications.generate_random_topology with parameters (network_type, num_nodes, avg_degree, min_distance_km, max_distance_km, seed)."
+        )
 
     if mode == "none":
         return [
@@ -384,7 +495,6 @@ def build_messages(query: str, mode: str, rag_enabled: bool) -> List[Dict[str, s
             {"role": "user", "content": json.dumps(user_payload)},
         ]
 
-    # few-shot
     sys = schema_rules + "\nDouble-check your arithmetic."
     return [
         {"role": "system", "content": sys},
@@ -394,31 +504,40 @@ def build_messages(query: str, mode: str, rag_enabled: bool) -> List[Dict[str, s
 
 # ------------------------------------ run() ------------------------------------
 def run(query: str, mode: str = "zero-shot", rag_enabled: bool = False) -> Dict[str, Any]:
-    """Run one interactive query.
-
-    Returns a dict:
-      - ok: bool
-      - llm_json: parsed JSON (or parse_error JSON)
-      - fig: matplotlib fig (optional)
-      - node_df/link_df/qot_df: dataframes (optional)
-      - token usage fields
-    """
+    """Run one interactive query."""
     global _TOPO_READY
 
-    # Ensure topology ready
     if not _TOPO_READY:
         net.build_topology(use_csv=True, visualize=False)
         _TOPO_READY = True
 
+    if not _is_in_scope(query):
+        oos = {
+            "result": {
+                "error": "OUT_OF_SCOPE",
+                "message": "Only optical network topology/equipment/QoT questions are supported.",
+            }
+        }
+        raw = json.dumps(oos)
+        return {
+            "ok": True,
+            "llm_json": oos,
+            "fig": None,
+            "node_df": None,
+            "link_df": None,
+            "qot_df": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "raw": raw,
+        }
+
+    flags = _query_flags(query)
+
     messages = build_messages(query, mode, rag_enabled)
     raw, prompt_tokens, completion_tokens, total_tokens = call_llm(messages, mode=mode)
 
-    chat_history.append(
-        {
-            "role": "user",
-            "content": query,
-        }
-    )
+    chat_history.append({"role": "user", "content": query})
     chat_history.append(
         {
             "role": "assistant",
@@ -433,10 +552,29 @@ def run(query: str, mode: str = "zero-shot", rag_enabled: bool = False) -> Dict[
         llm_json = _extract_first_json(raw)
         ok = True
     except Exception as e:
-        llm_json = {"task": "parse_error", "warnings": [str(e)], "result": {"raw": raw[:2000]}}
+        llm_json = {"result": {"error": "PARSE_ERROR", "message": str(e), "raw": raw[:2000]}}
         ok = False
 
-    # Optional: apply requested topology edits (LLM can include result.graph_edits)
+    # --- Post-parse sanitation for robustness ---
+    if isinstance(llm_json, dict):
+        res = llm_json.get("result")
+
+        # 1) If model incorrectly nested plot under result, lift it to top-level.
+        if isinstance(res, dict) and isinstance(res.get("plot"), dict) and not isinstance(llm_json.get("plot"), dict):
+            llm_json["plot"] = res.pop("plot")
+
+        # 2) If scalar query, strip plot/tables unless user explicitly requested visualization.
+        if isinstance(res, dict) and "value" in res and flags.get("scalar_hint") and not flags.get("viz_any"):
+            llm_json.pop("plot", None)
+            llm_json.pop("tables", None)
+
+        # 3) If plot contains forbidden heavy keys, drop them.
+        plot = llm_json.get("plot")
+        if isinstance(plot, dict):
+            for forbidden in ["data", "nodes", "edges", "links"]:
+                plot.pop(forbidden, None)
+
+    # Apply requested topology edits BEFORE rendering plot.
     try:
         if isinstance(llm_json, dict) and isinstance(llm_json.get("result"), dict):
             edits = llm_json["result"].get("graph_edits") or llm_json["result"].get("topology_modifications")
@@ -520,7 +658,6 @@ def benchmark_models(models: List[str], queries: List[str], rag_enabled: bool = 
                         "gpu_util_percent": gpu_util,
                         "cpu_percent": cpu,
                         "mem_percent": mem,
-                        "json_task": out.get("llm_json", {}).get("task") if isinstance(out.get("llm_json"), dict) else None,
                         "raw_output": out.get("raw"),
                     }
                 )
@@ -531,3 +668,4 @@ def benchmark_models(models: List[str], queries: List[str], rag_enabled: bool = 
 def run_experiment_from_yaml(models: List[str], yaml_file: str = "questions.yaml", rag_enabled: bool = False) -> pd.DataFrame:
     queries = load_benchmark_queries_from_yaml(yaml_file)
     return benchmark_models(models=models, queries=queries, rag_enabled=rag_enabled)
+

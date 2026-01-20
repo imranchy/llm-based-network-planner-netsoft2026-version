@@ -774,19 +774,80 @@ class NetworkGraph:
             "edges": edges,
         }
 
+
     def apply_graph_edits(self, edits: dict) -> dict:
         """Apply simple topology edits requested by the LLM.
 
         Supported keys:
+          - generate_random_topology: {network_type,num_nodes,avg_degree,min_distance_km,max_distance_km,seed}
           - add_edges: list of {u,v,distance_km,link_id,type}
           - remove_edges: list of {u,v}
 
         Returns a small summary dict.
         """
-        applied = {"added": 0, "removed": 0, "errors": []}
+        applied = {"added": 0, "removed": 0, "random_generated": False, "errors": []}
         if not isinstance(edits, dict):
             return applied
 
+        # ---------------- Random topology generation ----------------
+        # The LLM agent may pass either:
+        #   edits = {"generate_random_topology": {...}}
+        # or directly the spec dict (rare). Handle both.
+        try:
+            spec = None
+            if isinstance(edits.get("generate_random_topology"), dict):
+                spec = edits.get("generate_random_topology")
+            # Allow passing spec directly (if user_payload was simplified)
+            elif all(k in edits for k in ("num_nodes", "avg_degree")):
+                spec = edits
+
+            if isinstance(spec, dict):
+                network_type = str(spec.get("network_type") or spec.get("kind") or "metro")
+                num_nodes = int(spec.get("num_nodes") or spec.get("num_metro") or 0)
+                avg_degree = float(spec.get("avg_degree") or 2)
+                min_km = float(spec.get("min_distance_km") or spec.get("min_dist") or 1.0)
+                max_km = float(spec.get("max_distance_km") or spec.get("max_dist") or 10.0)
+                seed = int(spec.get("seed") or 42)
+
+                if num_nodes < 2:
+                    raise ValueError("num_nodes must be >= 2")
+
+                # Watts-Strogatz requires an even k and k < n
+                k = int(round(avg_degree))
+                if k < 2:
+                    k = 2
+                if k >= num_nodes:
+                    k = num_nodes - 1
+                if k % 2 == 1:
+                    k = max(2, k - 1)  # make even
+                if k >= num_nodes:
+                    k = num_nodes - 1
+                if k % 2 == 1 and k > 2:
+                    k -= 1
+
+                # Use the existing generator but with sanitized params
+                self.generate_topology(
+                    network_type=network_type,
+                    num_metro=num_nodes,
+                    avg_degree=k,
+                    min_dist=min_km,
+                    max_dist=max_km,
+                    seed=seed,
+                )
+
+                # Mark output + refresh positions
+                applied["random_generated"] = True
+
+                try:
+                    self.pos = nx.spring_layout(self.G, seed=seed)
+                except Exception:
+                    self.pos = nx.spring_layout(self.G, seed=42)
+
+                return applied
+        except Exception as e:
+            applied["errors"].append(f"generate_random_topology: {e}")
+
+        # ---------------- Edge removals ----------------
         try:
             for item in edits.get("remove_edges", []) or []:
                 if not isinstance(item, dict):
@@ -801,6 +862,7 @@ class NetworkGraph:
         except Exception as e:
             applied["errors"].append(f"remove_edges: {e}")
 
+        # ---------------- Edge additions ----------------
         try:
             for item in edits.get("add_edges", []) or []:
                 if not isinstance(item, dict):
@@ -814,6 +876,7 @@ class NetworkGraph:
                     dist = float(dist) if dist is not None else None
                 except Exception:
                     dist = None
+
                 self.G.add_edge(
                     u,
                     v,
@@ -833,6 +896,7 @@ class NetworkGraph:
             pass
 
         return applied
+
 
     def render_plot(self, plot_spec: dict):
         """Render a matplotlib figure from an LLM "plot" spec.
