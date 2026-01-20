@@ -1,0 +1,101 @@
+# ================================
+# CLEAN ICMLCN BENCHMARK YAML
+# Supports: zero-shot, one-shot, few-shot
+# All templates correspond to REAL functions
+# ================================
+
+##################################
+#   1. TOPOLOGY CONSTRUCTION
+##################################
+
+- query_template: "Create a topology from CSV files"
+  function_template: "net.build_topology(use_csv=True, visualize=True)"
+  variables: []
+
+- query_template: "Generate a random network topology"
+  function_template: "net.build_topology(use_random=True, visualize=True)"
+  variables: []
+
+- query_template: "Generate a {NETWORK_TYPE} network with {NUM_METRO} metros, {NUM_ACCESS} access links per metro, avg degree {AVG_DEGREE}, min distance {MIN_DIST}, max distance {MAX_DIST}"
+  function_template: "net.build_topology(network_type='{NETWORK_TYPE}', num_metro={NUM_METRO}, num_access_per_metro={NUM_ACCESS}, avg_degree={AVG_DEGREE}, min_dist={MIN_DIST}, max_dist={MAX_DIST}, visualize=True)"
+  variables: ["NETWORK_TYPE", "NUM_METRO", "NUM_ACCESS", "AVG_DEGREE", "MIN_DIST", "MAX_DIST"]
+
+
+##################################
+#   2. PATH QUERIES
+##################################
+
+- query_template: "Show the shortest path from {SRC} to {DST}"
+  function_template: "net.query_network_path('{SRC}', '{DST}', mode='shortest', visualize=True)"
+  variables: ["SRC", "DST"]
+
+- query_template: "Show the longest path from {SRC} to {DST}"
+  function_template: "net.query_network_path('{SRC}', '{DST}', mode='longest', visualize=True)"
+  variables: ["SRC", "DST"]
+
+- query_template: "List all possible paths between {SRC} and {DST}"
+  function_template: "net.query_network_path('{SRC}', '{DST}', mode='all', visualize=False)"
+  variables: ["SRC", "DST"]
+
+- query_template: "What is the total hop count and distance from {SRC} to {DST}?"
+  function_template: "net.query_network_path('{SRC}', '{DST}', mode='metric', visualize=False)"
+  variables: ["SRC", "DST"]
+
+
+##################################
+#   3. QoT QUERIES
+##################################
+
+- query_template: "Show ROP from {SRC} to {DST}"
+  function_template: "query_qot_metric('{SRC}', '{DST}', metric='ROP')"
+  variables: ["SRC", "DST"]
+
+- query_template: "Display BER between {SRC} and {DST}"
+  function_template: "query_qot_metric('{SRC}', '{DST}', metric='BER')"
+  variables: ["SRC", "DST"]
+
+- query_template: "Get OSNR for the link from {SRC} to {DST}"
+  function_template: "query_qot_metric('{SRC}', '{DST}', metric='OSNR')"
+  variables: ["SRC", "DST"]
+
+- query_template: "Calculate all QoT metrics from {SRC} to {DST}"
+  function_template: "query_qot_metric('{SRC}', '{DST}', metric='ALL')"
+  variables: ["SRC", "DST"]
+
+
+##################################
+#   4. LINK ANALYSIS
+##################################
+
+- query_template: "Show {LINK_TYPE} links under {DISTANCE} km"
+  function_template: "net.links_under_distance('{LINK_TYPE}', {DISTANCE})"
+  variables: ["LINK_TYPE", "DISTANCE"]
+
+- query_template: "Calculate average {LINK_TYPE} link distance"
+  function_template: "net.average_distance_link('{LINK_TYPE}')"
+  variables: ["LINK_TYPE"]
+
+- query_template: "Find maximum {LINK_TYPE} link distance"
+  function_template: "net.min_max_link_distance('{LINK_TYPE}', find_max=True)"
+  variables: ["LINK_TYPE"]
+
+- query_template: "Find minimum {LINK_TYPE} link distance"
+  function_template: "net.min_max_link_distance('{LINK_TYPE}', find_max=False)"
+  variables: ["LINK_TYPE"]
+
+
+##################################
+#   5. EQUIPMENT DEPLOYMENT & SUMMARY
+##################################
+
+- query_template: "Deploy network equipment"
+  function_template: "eqp_mngr.deploy_equipment()"
+  variables: []
+
+- query_template: "Show summary of deployed network equipment"
+  function_template: "eqp_mngr.summarize_equipment(visualize=False)"
+  variables: []
+
+- query_template: "Visualize equipment summary"
+  function_template: "eqp_mngr.summarize_equipment(visualize=True)"
+  variables: []
