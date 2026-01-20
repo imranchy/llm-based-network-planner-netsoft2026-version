@@ -26,6 +26,72 @@ OPTICAL_CONSTANTS = {
     "planck_Js": 6.62607e-34,
 }
 
+# ---------------------- Fiber reference (max values from provided table) ----------------------
+# Units:
+# - attenuation: dB/km
+# - propagation_delay: microseconds per km (us/km)
+#
+# Per project requirement: use ONLY these fibers and pick MAX values from the ranges.
+FIBER_REFERENCE = {
+    # SSMF (G.652): 0.18–0.20 dB/km, ~4.9–5.0 us/km
+    "ssmf": {"attenuation_dB_per_km": 0.20, "propagation_delay_us_per_km": 5.0},
+
+    # Bend-Insensitive SMF (G.657): 0.20–0.22 dB/km, ~5.0 us/km
+    "bend_insensitive_smf": {"attenuation_dB_per_km": 0.22, "propagation_delay_us_per_km": 5.0},
+
+    # Hollow-Core Fiber (HCF): ~0.25–1.0 dB/km, ~3.3–3.6 us/km
+    "hcf": {"attenuation_dB_per_km": 1.0, "propagation_delay_us_per_km": 3.6},
+}
+
+
+def normalize_fiber_type(fiber_type: str | None) -> str | None:
+    """Normalize fiber type strings to our internal keys.
+
+    Accepts several common user spellings.
+    """
+    if not fiber_type:
+        return None
+    ft = str(fiber_type).strip().lower()
+    aliases = {
+        "ssmf": "ssmf",
+        "g.652": "ssmf",
+        "g652": "ssmf",
+        "single-mode": "ssmf",
+        "single mode": "ssmf",
+        "single-mode fiber": "ssmf",
+        "single mode fiber": "ssmf",
+
+        "bend_insensitive_smf": "bend_insensitive_smf",
+        "bend-insensitive smf": "bend_insensitive_smf",
+        "bend insensitive smf": "bend_insensitive_smf",
+        "g.657": "bend_insensitive_smf",
+        "g657": "bend_insensitive_smf",
+
+        "hcf": "hcf",
+        "hollow-core": "hcf",
+        "hollow core": "hcf",
+        "hollow-core fiber": "hcf",
+        "hollow core fiber": "hcf",
+    }
+    return aliases.get(ft, ft)
+
+
+def fiber_params(fiber_type: str | None) -> dict | None:
+    """Return a dict with attenuation_dB_per_km and propagation_delay_ms_per_km."""
+    key = normalize_fiber_type(fiber_type)
+    if not key:
+        return None
+    spec = FIBER_REFERENCE.get(key)
+    if not spec:
+        return None
+    delay_ms_per_km = float(spec["propagation_delay_us_per_km"]) / 1000.0
+    return {
+        "fiber_type": key,
+        "attenuation_dB_per_km": float(spec["attenuation_dB_per_km"]),
+        "propagation_delay_us_per_km": float(spec["propagation_delay_us_per_km"]),
+        "propagation_delay_ms_per_km": delay_ms_per_km,
+    }
+
 # ---------------------- Basic helpers ----------------------
 def dBm_to_mW(p_dBm: float) -> float:
     return 10 ** (p_dBm / 10.0)
@@ -62,14 +128,27 @@ def calc_ase_noise(gain_dB: float, nf_dB: float, B_ref_Hz: float | None = None) 
 # ---------------------- Simple path-level metrics ----------------------
 def calc_qot_metrics(
     distance_km: float,
-    att_per_km: float = OPTICAL_CONSTANTS["fiber_att_dB_per_km"],
-    delay_per_km_ms: float = 0.005,
+    fiber_type: str | None = None,
+    att_per_km: float | None = None,
+    delay_per_km_ms: float | None = None,
     optical_params: dict | None = None
 ) -> dict:
     """
     Lightweight attenuation + delay model per edge or path segment.
     (Detailed OSNR/GSNR/Q/BER is computed in QoTAnalyzer.)
     """
+    # Defaults (backward compatible)
+    if att_per_km is None:
+        att_per_km = OPTICAL_CONSTANTS["fiber_att_dB_per_km"]
+    if delay_per_km_ms is None:
+        delay_per_km_ms = 0.005
+
+    # If a fiber_type is provided, override with the project's fiber reference.
+    fp = fiber_params(fiber_type)
+    if fp:
+        att_per_km = fp["attenuation_dB_per_km"]
+        delay_per_km_ms = fp["propagation_delay_ms_per_km"]
+
     total_atten_dB = float(distance_km) * float(att_per_km)
     total_delay_ms = float(distance_km) * float(delay_per_km_ms)
 

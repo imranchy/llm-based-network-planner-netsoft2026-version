@@ -37,6 +37,7 @@ import ollama
 from graph_processor import NetworkGraph
 from qot_analyzer import QoTAnalyzer
 from equipment_manager import EquipmentManager
+from qot_utils import FIBER_REFERENCE
 
 
 # ------------------------------ Model registry ------------------------------
@@ -318,7 +319,26 @@ def build_messages(query: str, mode: str, rag_enabled: bool) -> List[Dict[str, s
         "You MUST compute graph analytics yourself from the provided topology snapshot.\n"
         "Do NOT ask Python/networkx to compute shortest paths, degrees, etc.\n"
         "If asked about equipment deployment, do NOT invent. Use reference.equipment_tables_csv if present and return it as tables named 'node_equipment' and 'link_equipment'.\n"
+        "If asked about propagation delay and/or fiber attenuation, use reference.fiber_reference and compute: \n"
+        "  - total_distance_km = sum(edge.distance_km) along the chosen path\n"
+        "  - propagation_delay_ms = total_distance_km * propagation_delay_ms_per_km\n"
+        "  - attenuation_dB = total_distance_km * attenuation_dB_per_km\n"
+        "Return these in result when relevant (and include the path used).\n"
     )
+
+    # Expand fiber reference with ms/km for the LLM (deterministic arithmetic).
+    fiber_reference = {}
+    try:
+        for k, v in (FIBER_REFERENCE or {}).items():
+            att = float(v.get("attenuation_dB_per_km"))
+            delay_us = float(v.get("propagation_delay_us_per_km"))
+            fiber_reference[str(k)] = {
+                "attenuation_dB_per_km": att,
+                "propagation_delay_us_per_km": delay_us,
+                "propagation_delay_ms_per_km": delay_us / 1000.0,
+            }
+    except Exception:
+        fiber_reference = {}
 
     user_payload: Dict[str, Any] = {
         "user_query": query,
@@ -327,11 +347,15 @@ def build_messages(query: str, mode: str, rag_enabled: bool) -> List[Dict[str, s
             "ila_spacing_km": getattr(net, "ila_spacing_km", None),
             "qot_params": getattr(net, "qot_params", None),
             "equipment_tables_csv": equip_tables_csv,
+            "fiber_reference": fiber_reference,
         },
         "notes": [
             "Distances are in km (edge.distance_km).",
             "Edges are undirected.",
             "link_id prefix ML/AL indicates link family.",
+            "Fiber reference keys supported: ssmf, bend_insensitive_smf, hcf.",
+            "If the user does not specify a fiber type, default to ssmf.",
+            "To answer delay/attenuation questions: pick a path, sum distances, then multiply by the per-km constants.",
         ],
     }
 

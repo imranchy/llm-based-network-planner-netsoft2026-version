@@ -176,6 +176,17 @@ class EquipmentManager:
         })
 
         # Link Table
+        # Fiber selection:
+        # - If an edge has a 'fiber_type' attribute, we use it.
+        # - Otherwise we fall back to net.qot_params['fiber_type'] if provided.
+        default_fiber_type = None
+        try:
+            qp = getattr(self.net, "qot_params", None)
+            if isinstance(qp, dict):
+                default_fiber_type = qp.get("fiber_type")
+        except Exception:
+            default_fiber_type = None
+
         for edge in link_subset:
             u, v = (edge if len(edge) == 2 else (edge[0], edge[1]))
 
@@ -188,7 +199,8 @@ class EquipmentManager:
             total_gain += gain
             total_noise += noise
 
-            qot_metrics = calc_qot_metrics(distance, optical_params=optical)
+            edge_fiber_type = d.get("fiber_type") or default_fiber_type
+            qot_metrics = calc_qot_metrics(distance, fiber_type=edge_fiber_type, optical_params=optical)
             attenuation = qot_metrics.get("Total Attenuation (dB)", 0.0)
             delay = qot_metrics.get("Total Propagation Delay (ms)", 0.0)
 
