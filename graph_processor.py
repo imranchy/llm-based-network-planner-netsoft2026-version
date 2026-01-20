@@ -946,3 +946,14 @@ class NetworkGraph:
             title=title,
             highlight_color=highlight_color,
         )
+
+# ==========================
+# Fiber-constrained analysis helper (NON-INTRUSIVE)
+# ==========================
+def fiber_reference_snapshot(self):
+    """Expose fiber constants to the LLM; no optimization done in Python."""
+    try:
+        from qot_utils import FIBER_REFERENCE
+        return FIBER_REFERENCE
+    except Exception:
+        return {}
