@@ -9,6 +9,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import os
 import random
+from typing import Any, Dict, List, Optional
 from qot_analyzer import QoTAnalyzer
 from graph_utils import interactive_plot, resolve_nodes
 from qot_utils import calc_qot_metrics
@@ -287,7 +288,7 @@ class NetworkGraph:
             path_data.append({
                 "Path #": idx,
                 "Nodes": path,
-                "Total Distance (km)": round(total_distance, 2),
+                "Total Distance (km)": float(total_distance),
                 "Hop Count": len(path) - 1
             })
 
@@ -300,7 +301,7 @@ class NetworkGraph:
                 if mode == "shortest"
                 else node_df["Total Distance (km)"].idxmax()
             )
-            best_path = all_paths[best_idx]
+            best_path = node_df.loc[best_idx, "Nodes"]
             if visualize:
                 _, fig = self._visualize_path(
                     best_path,
@@ -653,23 +654,48 @@ class NetworkGraph:
 
     # ----- Visualization helpers -----
     @interactive_plot
-    def _visualize_graph(self, highlight_edges=None, highlight_nodes=None, title="Network Graph", highlight_color="red"):
+    def _visualize_graph(self, highlight_edges=None, highlight_nodes=None, title="Network Graph", highlight_color="red", only_highlight: bool = False):
         fig, ax = plt.subplots(figsize=(12, 8))
 
-        nx.draw(self.G, 
-                self.pos, 
-                with_labels=True, 
-                node_color="lightblue",
-                font_size=8, 
-                node_size=500, 
-                ax=ax)
-        nx.draw_networkx_edges(self.G, self.pos, edge_color="gray", width=1.0, ax=ax)
+        # Optionally render only the highlighted subgraph (used for "plot path only")
+        G_to_draw = self.G
+        pos = self.pos
+
+        if only_highlight:
+            try:
+                if highlight_edges:
+                    # Preserve edge attributes (weight/link_id/type) via edge_subgraph
+                    G_to_draw = self.G.edge_subgraph(highlight_edges).copy()
+                elif highlight_nodes:
+                    G_to_draw = self.G.subgraph(highlight_nodes).copy()
+            except Exception:
+                G_to_draw = self.G
+
+        # Use cached positions if available, otherwise compute for the subgraph
+        if isinstance(pos, dict) and G_to_draw is not self.G:
+            pos = {n: pos[n] for n in G_to_draw.nodes() if n in pos}
+        if not isinstance(pos, dict) or len(pos) != G_to_draw.number_of_nodes():
+            try:
+                pos = nx.spring_layout(G_to_draw, seed=42)
+            except Exception:
+                pos = nx.spring_layout(G_to_draw)
+
+        nx.draw(
+            G_to_draw,
+            pos,
+            with_labels=True,
+            node_color="lightblue",
+            font_size=8,
+            node_size=500,
+            ax=ax,
+        )
+        nx.draw_networkx_edges(G_to_draw, pos, edge_color="gray", width=1.0, ax=ax)
 
         # Optional highlights
         if highlight_edges:
             nx.draw_networkx_edges(
-                self.G,
-                self.pos,
+                G_to_draw,
+                pos,
                 edgelist=highlight_edges,
                 edge_color=highlight_color,
                 width=2.5,
@@ -678,8 +704,8 @@ class NetworkGraph:
 
         if highlight_nodes:
             nx.draw_networkx_nodes(
-                self.G,
-                self.pos,
+                G_to_draw,
+                pos,
                 nodelist=highlight_nodes,
                 node_color="orange",
                 node_size=850,
@@ -688,9 +714,9 @@ class NetworkGraph:
 
         edge_labels = {
             (u, v): f"{d.get('link_id', '')} ({d.get('weight', '?')} km)"
-            for u, v, d in self.G.edges(data=True)
+            for u, v, d in G_to_draw.edges(data=True)
         }
-        nx.draw_networkx_edge_labels(self.G, self.pos, edge_labels=edge_labels, font_size=8, ax=ax)
+        nx.draw_networkx_edge_labels(G_to_draw, pos, edge_labels=edge_labels, font_size=8, ax=ax)
 
         ax.set_title(title)
         ax.axis("off")
@@ -708,26 +734,44 @@ class NetworkGraph:
     # Plot spec renderer (LLM-first)
     # ==========================
     @interactive_plot
-    def _visualize_path(self, path, title="Network Path", highlight_color="red"):
+    def _visualize_path(self, path, title="Network Path", highlight_color="red", only_highlight: bool = False):
         import matplotlib.pyplot as plt
         import networkx as nx
 
         fig, ax = plt.subplots(figsize=(12, 8))
 
-        nx.draw(self.G, self.pos, with_labels=True, node_color="lightblue", node_size=500, ax=ax)
-        nx.draw_networkx_edges(self.G, self.pos, edge_color="gray", width=1.0, ax=ax)
-
         path_edges = list(zip(path, path[1:]))
+
+        # Optionally draw only the path subgraph (no full topology underlay)
+        G_to_draw = self.G
+        pos = self.pos
+        if only_highlight:
+            try:
+                G_to_draw = self.G.edge_subgraph(path_edges).copy()
+            except Exception:
+                G_to_draw = self.G
+
+        if isinstance(pos, dict) and G_to_draw is not self.G:
+            pos = {n: pos[n] for n in G_to_draw.nodes() if n in pos}
+        if not isinstance(pos, dict) or len(pos) != G_to_draw.number_of_nodes():
+            try:
+                pos = nx.spring_layout(G_to_draw, seed=42)
+            except Exception:
+                pos = nx.spring_layout(G_to_draw)
+
+        nx.draw(G_to_draw, pos, with_labels=True, node_color="lightblue", node_size=500, ax=ax)
+        nx.draw_networkx_edges(G_to_draw, pos, edge_color="gray", width=1.0, ax=ax)
+
         nx.draw_networkx_edges(
-            self.G, self.pos, edgelist=path_edges, edge_color=highlight_color, width=3.0, ax=ax
+            G_to_draw, pos, edgelist=path_edges, edge_color=highlight_color, width=3.0, ax=ax
         )
-        nx.draw_networkx_nodes(self.G, self.pos, nodelist=path, node_color="orange", node_size=800, ax=ax)
+        nx.draw_networkx_nodes(G_to_draw, pos, nodelist=path, node_color="orange", node_size=800, ax=ax)
 
         edge_labels = {
             (u, v): f"{self.G[u][v].get('link_id', '')} ({self.G[u][v].get('weight', '?')} km)"
             for u, v in path_edges
         }
-        nx.draw_networkx_edge_labels(self.G, self.pos, edge_labels=edge_labels, font_size=8, ax=ax)
+        nx.draw_networkx_edge_labels(G_to_draw, pos, edge_labels=edge_labels, font_size=8, ax=ax)
 
         ax.set_title(title)
         ax.axis("off")
@@ -915,6 +959,7 @@ class NetworkGraph:
 
         title = str(plot_spec.get("title") or "Network Topology")
         highlight_color = str(plot_spec.get("highlight_color") or "red")
+        only_highlight = bool(plot_spec.get("only_highlight", False))
 
         he = plot_spec.get("highlight_edges")
         hn = plot_spec.get("highlight_nodes")
@@ -945,6 +990,7 @@ class NetworkGraph:
             highlight_nodes=highlight_nodes,
             title=title,
             highlight_color=highlight_color,
+            only_highlight=only_highlight,
         )
 
 # ==========================
@@ -957,3 +1003,25 @@ def fiber_reference_snapshot(self):
         return FIBER_REFERENCE
     except Exception:
         return {}
+
+# ------------------ Deterministic helpers for benchmarking ------------------
+def shortest_path(self, src: str, dst: str) -> List[str]:
+    """Weighted shortest path by distance_km (NetworkX Dijkstra)."""
+    src, dst = resolve_nodes(self.G, src, dst)
+    if src is None or dst is None:
+        raise ValueError("Invalid src/dst node id")
+    return nx.shortest_path(self.G, source=src, target=dst, weight="weight")
+
+def path_distance_km(self, path: List[str]) -> float:
+    """Sum of edge distances along a path."""
+    if not path or len(path) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i + 1]
+        d = self.G.get_edge_data(u, v) or {}
+        w = d.get("weight")
+        if w is None:
+            raise ValueError(f"Missing distance for edge {u}-{v}")
+        total += float(w)
+    return float(total)

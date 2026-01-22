@@ -1,71 +1,53 @@
-
 """llm_agent.py
 
-NetSoft 2026 edition (LLM-first analytics + optional RAG)
---------------------------------------------------------
+NetSoft 2026 edition — Hybrid LLM + Python analytics
+---------------------------------------------------
 
-This agent intentionally does NOT ask the LLM to emit Python function calls.
-Instead, it:
-  1) Builds (or loads) a topology in Python (structure only)
-  2) Sends a JSON-friendly snapshot of the graph + optional context
-  3) Asks the LLM to compute analytics (paths, degrees, hop count, etc.)
-  4) Parses ONE strict JSON object from the LLM
-  5) Optionally renders a plot using the LLM's "plot" spec
+- Python performs deterministic computations:
+  * topology build (from CSV)
+  * shortest path / longest simple path / all simple paths count
+  * fewest-hop path
+  * graph metrics (degrees, diameter, average shortest path length)
+  * link statistics (filters, averages, top-k)
+  * equipment deployment + summary tables
 
-Important policy for this codebase:
-  - Graph analytics are computed by the LLM.
-  - QoT calculations remain in Python (reference model), as requested.
+- The LLM is a fallback for anything not covered.
 
 Expected files in project root:
   - distance.csv
   - city.csv
-  - questions.yaml
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import ollama
 import pandas as pd
 import psutil
-import yaml
 
 from equipment_manager import EquipmentManager
 from graph_processor import NetworkGraph
-from qot_analyzer import QoTAnalyzer
-
-# Fiber reference table (max values from the provided fiber table image).
-# Used to provide deterministic attenuation/delay constants to the LLM.
-try:
-    from qot_utils import FIBER_REFERENCE  # type: ignore
-except Exception:
-    FIBER_REFERENCE = {}
-
 
 # ------------------------------ Model registry ------------------------------
 VALID_MODELS = {
-    "qwen2.5:14b",
-    "qwen2.5:7b",
-    "llama3:8b",
-    "llama3:latest",
-    "mistral:7b",
-    "gemma:7b",
-    "gemma2:latest",
-    "gemma3:4b",
+    "qwen2.5:14b-instruct",
+    "llama3.1:8b",
+    "mistral-nemo:12b",
+    "gemma2:9b",
 }
 
-_ACTIVE_MODEL = "llama3:8b"
+_ACTIVE_MODEL = "qwen2.5:14b-instruct"
 
 
 def set_model(name: str) -> None:
     global _ACTIVE_MODEL
     if name not in VALID_MODELS:
-        raise ValueError(f"Model '{name}' is not installed. Update VALID_MODELS or pull it via ollama.")
+        raise ValueError(
+            f"Model '{name}' is not installed. Update VALID_MODELS or pull it via ollama."
+        )
     _ACTIVE_MODEL = name
 
 
@@ -75,86 +57,72 @@ def get_model() -> str:
 
 # ------------------------------ Shared state ------------------------------
 net = NetworkGraph("distance.csv", "city.csv")
-qot = QoTAnalyzer(net)
 eqp_mngr = EquipmentManager(net)
-
-chat_history: List[Dict[str, Any]] = []
 _TOPO_READY = False
 
 
 def _reset_state() -> None:
     """Reset global state between runs/benchmarks for fair comparisons."""
-    global chat_history, _TOPO_READY, net, qot, eqp_mngr
-    chat_history.clear()
+    global _TOPO_READY, net, eqp_mngr
     _TOPO_READY = False
     net = NetworkGraph("distance.csv", "city.csv")
-    qot = QoTAnalyzer(net)
     eqp_mngr = EquipmentManager(net)
 
 
-# ------------------------- YAML query loader -------------------------
-def _safe_fill(template: str, values: dict) -> str:
-    def repl(m):
-        key = m.group(1)
-        return str(values.get(key, m.group(0)))
-
-    return re.sub(r"\{([A-Za-z0-9_]+)\}", repl, template)
+# --------------------------- CPU / RAM / GPU logging ---------------------------
+_NVML = {"ok": False, "h": None}
 
 
-def load_benchmark_queries_from_yaml(
-    yaml_file: str = "questions.yaml",
-    default_vars: Optional[dict] = None,
-) -> List[str]:
-    default_vars = default_vars or {
-        "NETWORK_TYPE": "metro",
-        "NUM_METRO": 5,
-        "NUM_ACCESS": 2,
-        "AVG_DEGREE": 2,
-        "MIN_DIST": 1,
-        "MAX_DIST": 10,
-        "SRC": "M1",
-        "DST": "M3",
-        "LINK_TYPE": "ML",
-        "DISTANCE": 50,
-    }
-    if not os.path.exists(yaml_file):
-        return []
-    with open(yaml_file, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or []
+def _nvml_init_once() -> None:
+    if _NVML["ok"]:
+        return
+    try:
+        import pynvml
 
-    queries: List[str] = []
-    for item in data:
-        qt = item.get("query_template")
-        if isinstance(qt, str) and qt.strip():
-            queries.append(_safe_fill(qt, default_vars))
+        pynvml.nvmlInit()
+        _NVML["h"] = pynvml.nvmlDeviceGetHandleByIndex(0)
+        _NVML["ok"] = True
+    except Exception:
+        _NVML["ok"] = False
+        _NVML["h"] = None
 
-    seen = set()
-    dedup: List[str] = []
-    for q in queries:
-        if q not in seen:
-            dedup.append(q)
-            seen.add(q)
-    return dedup
+
+def read_gpu_usage() -> Tuple[Optional[float], Optional[float]]:
+    try:
+        import pynvml
+
+        _nvml_init_once()
+        if not _NVML["ok"] or _NVML["h"] is None:
+            return None, None
+        h = _NVML["h"]
+        power = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
+        util = float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+        return float(power), float(util)
+    except Exception:
+        return None, None
+
+
+def read_cpu_usage() -> Tuple[Optional[float], Optional[float]]:
+    try:
+        cpu_percent = float(psutil.cpu_percent(interval=None))
+        mem_percent = float(psutil.virtual_memory().percent)
+        return cpu_percent, mem_percent
+    except Exception:
+        return None, None
 
 
 # ------------------------------ Ollama call ------------------------------
 _DEF_SEED = 12345
 
 
-def _decode_options_for_mode(mode: str) -> dict:
-    base = {"seed": _DEF_SEED, "top_p": 1.0}
-    if mode == "none":
-        return {**base, "temperature": 0.2, "num_predict": 600}
-    if mode == "zero-shot":
-        return {**base, "temperature": 0.0, "num_predict": 520}
-    if mode == "one-shot":
-        return {**base, "temperature": 0.0, "num_predict": 700}
-    return {**base, "temperature": 0.05, "num_predict": 800}
+def _decode_options() -> dict:
+    # Deterministic benchmarking-friendly options
+    return {"seed": _DEF_SEED, "top_p": 1.0, "temperature": 0.0, "num_predict": 500}
 
 
-def call_llm(messages: List[Dict[str, str]], mode: str = "zero-shot"):
-    r = ollama.chat(model=_ACTIVE_MODEL, messages=messages, options=_decode_options_for_mode(mode))
-    content = r["message"]["content"].strip()
+def call_llm(messages: List[Dict[str, str]]) -> Tuple[str, Optional[int], Optional[int], Optional[int]]:
+    r = ollama.chat(model=_ACTIVE_MODEL, messages=messages, options=_decode_options())
+    content = (r["message"]["content"] or "").strip()
     prompt_tokens = r.get("prompt_eval_count")
     completion_tokens = r.get("eval_count")
     total_tokens = None
@@ -163,449 +131,625 @@ def call_llm(messages: List[Dict[str, str]], mode: str = "zero-shot"):
     return content, prompt_tokens, completion_tokens, total_tokens
 
 
-# --------------------------- GPU / CPU logging ---------------------------
-def read_gpu_usage():
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
-        power = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
-        util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
-        pynvml.nvmlShutdown()
-        return power, util
-    except Exception:
-        return None, None
-
-
-def read_cpu_usage():
-    try:
-        cpu_percent = psutil.cpu_percent(interval=None)
-        mem = psutil.virtual_memory().percent
-        return cpu_percent, mem
-    except Exception:
-        return None, None
-
-
 # ------------------------------ JSON extraction ------------------------------
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _extract_first_json(text: str) -> Dict[str, Any]:
-    """Extract and parse the first JSON object from a model reply."""
-    cleaned = text.strip()
+    cleaned = (text or "").strip()
     cleaned = re.sub(r"```\s*(json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.replace("```", "")
-    cleaned = cleaned.strip()
+    cleaned = cleaned.replace("```", "").strip()
     m = _JSON_RE.search(cleaned)
     if not m:
         raise ValueError("No JSON object found in model response")
-    candidate = m.group(0)
-    return json.loads(candidate)
+    return json.loads(m.group(0))
 
 
-def _json_sanitize(obj: Any) -> Any:
-    """Recursively convert non-JSON-safe objects to JSON-serializable types."""
-    if isinstance(obj, dict):
-        return {str(k): _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_sanitize(x) for x in obj]
-    if isinstance(obj, set):
-        return [_json_sanitize(x) for x in sorted(obj, key=lambda x: str(x))]
+# ------------------------------ Query flags / parsing ------------------------------
+_NODE_RE = re.compile(r"\b(M\d+)\b", re.IGNORECASE)
 
-    if hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes, bytearray)):
-        try:
-            return [_json_sanitize(x) for x in list(obj)]
-        except Exception:
-            pass
-
-    try:
-        import numpy as np
-
-        if isinstance(obj, (np.integer, np.floating)):
-            return obj.item()
-    except Exception:
-        pass
-
-    return obj
-
-
-# ------------------------------ Query intent helpers ------------------------------
 
 def _query_flags(q: str) -> Dict[str, bool]:
-    ql = (q or "").strip().lower()
-
-    scalar_hint = bool(re.search(r"\b(how many|total number of|total count|count of|number of)\b", ql))
-
-    viz_any = bool(
-        re.search(r"\b(plot|draw|visuali[sz]e|render|diagram|topology|graph|network)\b", ql)
-        or bool(re.search(r"\b(from csv|csv files?)\b", ql))
-    )
-
-    viz_full = bool(
-        re.search(r"\b(draw|plot|visuali[sz]e|render|create|show)\b.*\b(topology|graph|network)\b", ql)
-        or bool(re.search(r"\b(create|draw|plot|visuali[sz]e|render)\b.*\b(from csv|csv files?)\b", ql))
-    )
-
-    viz_path = bool(re.search(r"\b(show|draw|plot|visuali[sz]e)\b.*\b(shortest path|path)\b", ql))
-
-    random_gen = bool(re.search(r"\b(generate|create|make)\b.*\b(random)\b.*\b(topology|graph|network)\b", ql))
-
-    # If we generate a topology, we should also plot it by default.
-    if random_gen:
-        viz_any = True
-        viz_full = True
-
-    return {
-        "scalar_hint": scalar_hint,
-        "viz_any": viz_any,
-        "viz_full": viz_full,
-        "viz_path": viz_path,
-        "random_gen": random_gen,
-    }
-
-
-def _is_in_scope(q: str) -> bool:
-    """Cheap Python-side domain gate to prevent unrelated questions reaching the LLM."""
     ql = (q or "").lower()
 
-    network_terms = [
-        "topology",
-        "graph",
-        "node",
-        "link",
-        "path",
-        "shortest",
-        "hop",
-        "degree",
-        "distance",
-        "equipment",
-        "roamd",
-        "roadm",
-        "amp",
-        "amplifier",
-        "pre-amp",
-        "preamp",
-        "booster",
-        "ila",
-        "attenuation",
-        "propagation",
-        "delay",
-        "qot",
-        "osnr",
-        "gsnr",
-        "snr",
-        "fiber",
-        "ssmf",
-        "hcf",
-        "csv",
-        "random topology",
-    ]
+    no_plot = bool(re.search(r"\b(no plot|no visualization|without visualization)\b", ql))
+    viz_any = bool(re.search(r"\b(plot|draw|visuali[sz]e|render)\b", ql)) and not no_plot
 
-    oos_terms = [
-        "holiday",
-        "vacation",
-        "travel",
-        "berlin",
-        "paris",
-        "london",
-        "make a cup of tea",
-        "recipe",
-        "cook",
-        "hotel",
-        "flight",
-        "restaurant",
-    ]
+    path_only = bool(re.search(r"\b(path only|only the path|not the full topology|not the topology|do not show full topology)\b", ql))
 
-    has_network = any(t in ql for t in network_terms)
-    has_oos = any(t in ql for t in oos_terms)
-
-    if has_oos and not has_network:
-        return False
-    if not has_network:
-        return False
-    return True
-
-
-# ------------------------------ Prompting ------------------------------
-_ONE_SHOT_EXAMPLE = {
-    "question": "Show the shortest path from M1 to M3 and plot it",
-    "answer": {
-        "result": {"path": ["M1", "M2", "M3"], "total_distance_km": 123.4, "hop_count": 2},
-        "plot": {
-            "title": "Shortest path M1 to M3",
-            "highlight_edges": [["M1", "M2"], ["M2", "M3"]],
-            "highlight_nodes": ["M1", "M2", "M3"],
-        },
-    },
-}
-
-
-def build_messages(query: str, mode: str, rag_enabled: bool) -> List[Dict[str, str]]:
-    topology = _json_sanitize(net.topology_snapshot())
-
-    flags = _query_flags(query)
-
-    equip_hint = bool(
+    # IMPORTANT: include "longest path" (not only "longest simple path")
+    path_intent = bool(
         re.search(
-            r"\b(equipment|deploy|router|switch|amplifier|ila|qot|osnr|g?snr|ber|nf|gain|pre-amp|preamp|booster)\b",
-            query,
-            re.IGNORECASE,
+            r"\b(shortest path|longest simple path|longest path|list all simple paths|fewest hops)\b",
+            ql,
         )
     )
-    equip_tables_csv = None
-    if equip_hint:
-        try:
-            eqp_mngr.deploy_equipment()
-            s = eqp_mngr.summarize_equipment(visualize=False)
-            node_df = s.get("node_df", pd.DataFrame())
-            link_df = s.get("link_df", pd.DataFrame())
-            parts = []
-            if isinstance(node_df, pd.DataFrame) and not node_df.empty:
-                parts.append("NODE_EQUIPMENT_TABLE_CSV\n" + node_df.to_csv(index=False))
-            if isinstance(link_df, pd.DataFrame) and not link_df.empty:
-                parts.append("LINK_EQUIPMENT_TABLE_CSV\n" + link_df.to_csv(index=False))
-            if parts:
-                equip_tables_csv = "\n\n".join(parts)[:12000]
-        except Exception:
-            equip_tables_csv = None
 
-    schema_rules = (
-        "Return exactly ONE valid JSON object. No markdown, no code fences, no extra text.\n"
-        "Allowed top-level keys ONLY: result, tables, plot.\n"
-        "Do NOT include any other top-level keys.\n"
-        "Do NOT place 'plot' inside 'result'. 'plot' MUST be top-level.\n"
-        "\n"
-        "DOMAIN SCOPE (HARD RULE):\n"
-        "You may ONLY answer questions about: optical network topology (nodes/links), graph metrics (paths, degrees, hops), "
-        "equipment deployment (from reference.equipment_tables_csv), and QoT (distance, attenuation, propagation delay).\n"
-        "If the user request is outside this scope (travel, food, general knowledge, etc.), return ONLY:\n"
-        '{ "result": { "error": "OUT_OF_SCOPE", "message": "Only optical network topology/equipment/QoT questions are supported." } }\n'
-        "\n"
-        "OUTPUT MINIMALITY (HARD RULE):\n"
-        "- If the user asks for a single scalar value (count/total/how many), return ONLY:\n"
-        '  { "result": { "value": <number> } }\n'
-        "  Do NOT include plot or tables.\n"
-        "- Do NOT add any commentary or summaries unless the user explicitly asks.\n"
-        "\n"
-        "RANDOM TOPOLOGY GENERATION (HARD RULE):\n"
-        "If the user asks to generate/create a random topology/graph/network, you MUST request a Python-side topology change by returning:\n"
-        '  { "result": { "topology_modifications": { "generate_random_topology": { ... } } }, "plot": { ... } }\n'
-        "The generate_random_topology object may include: network_type/kind, num_nodes/num_metro, avg_degree, min_distance_km, max_distance_km, seed.\n"
-        "When generating a random topology, also return a plot that draws the full topology (highlight_edges='ALL', highlight_nodes='ALL').\n"
-        "\n"
-        "PLOT CONTRACT (HARD RULE):\n"
-        "If the user asks to show/draw/plot/visualize/render/create a topology or graph, you MUST return a top-level 'plot' object.\n"
-        "The plot object MUST be small and MUST NOT contain 'data', 'nodes', 'edges', 'links', or any raw topology.\n"
-        "The ONLY allowed keys inside plot are:\n"
-        "  - title: string\n"
-        "  - highlight_edges: 'ALL' or true or list of [u, v] pairs\n"
-        "  - highlight_nodes: 'ALL' or true or list of node ids\n"
-        "  - highlight_color: optional string\n"
-        "\n"
-        "Plot behavior rules:\n"
-        "- For full-topology requests: set highlight_edges='ALL' and highlight_nodes='ALL'.\n"
-        "- For path requests (e.g., shortest path M1 to M3) when visualization is requested:\n"
-        "  * compute the path\n"
-        "  * set highlight_nodes to the path nodes\n"
-        "  * set highlight_edges to ONLY the consecutive edges along that path\n"
-        "  * do NOT use 'ALL'.\n"
-        "\n"
-        "GRAPH RULES:\n"
-        "You MUST compute graph analytics yourself from the provided topology snapshot.\n"
-        "Do NOT ask for Python/networkx.\n"
-        "\n"
-        "EQUIPMENT RULES:\n"
-        "If asked about equipment, do NOT invent. Use reference.equipment_tables_csv if present.\n"
-        "Return tables ONLY if explicitly requested.\n"
-        "\n"
-        "PROPAGATION/ATTENUATION RULES:\n"
-        "CONSTRAINED FIBER OPTIMIZATION (HARD RULE):\n"
-        "If the user asks to minimize propagation delay using different fiber pairs with constraints "
-        "(e.g., 'HCF restricted to only 1 span', 'exactly 4 spans from M1 to M6'), YOU must:\n"
-        "1) Enumerate all simple paths between SRC and DST from the topology snapshot.\n"
-        "2) Discard paths not matching the required span count (hop count).\n"
-        "3) For each remaining path, assign fiber types per span such that constraints are met "
-        "(e.g., at most one HCF span).\n"
-        "4) Use reference.fiber_reference to compute per-span and total propagation delay.\n"
-        "5) Select the combination with minimum total delay.\n"
-        "6) Return JSON with: path, hop_count, fiber_assignment_per_span, total_propagation_delay_ms.\n"
-        "Do NOT ask Python to optimize. Do NOT invent constants.\n"
-
-        "If asked about propagation delay and/or attenuation, use reference.fiber_reference.\n"
-        "Compute:\n"
-        "  - total_distance_km = sum(edge.distance_km) along the chosen path\n"
-        "  - propagation_delay_ms = total_distance_km * propagation_delay_ms_per_km\n"
-        "  - attenuation_dB = total_distance_km * attenuation_dB_per_km\n"
-    )
-
-    # Expand fiber reference with ms/km for deterministic arithmetic.
-    fiber_reference: Dict[str, Dict[str, float]] = {}
-    try:
-        for k, v in (FIBER_REFERENCE or {}).items():
-            att = float(v.get("attenuation_dB_per_km"))
-            delay_us = float(v.get("propagation_delay_us_per_km"))
-            fiber_reference[str(k)] = {
-                "attenuation_dB_per_km": att,
-                "propagation_delay_us_per_km": delay_us,
-                "propagation_delay_ms_per_km": delay_us / 1000.0,
-            }
-    except Exception:
-        fiber_reference = {}
-
-    user_payload: Dict[str, Any] = {
-        "user_query": query,
-        "topology": topology,
-        "reference": {
-            "ila_spacing_km": getattr(net, "ila_spacing_km", None),
-            "qot_params": getattr(net, "qot_params", None),
-            "equipment_tables_csv": equip_tables_csv,
-            "fiber_reference": fiber_reference,
-        },
-        "notes": [
-            "Distances are in km (edge.distance_km).",
-            "Edges are undirected.",
-            "link_id prefix ML/AL indicates link family.",
-            "Fiber reference keys supported: ssmf, bend_insensitive_smf, hcf.",
-            "If the user does not specify a fiber type, default to ssmf.",
-        ],
+    return {
+        "no_plot": no_plot,
+        "viz_any": viz_any,
+        "path_only": path_only,
+        "equip": bool(re.search(r"\b(deploy|equipment|roadm|trx|ila|preamp|amp)\b", ql)),
+        "path": path_intent,
+        "topology": bool(re.search(r"\b(topology|from csv|csv files?)\b", ql)),
+        "link_stats": bool(
+            re.search(
+                r"\b(ml links|al links|longest links|average .* link distance|max .* link distance|maximum .* link distance)\b",
+                ql,
+            )
+        ),
+        "graph_stats": bool(
+            re.search(
+                r"\b(highest degree|lowest degree|average node degree|degree 1|degree >=|isolated|top 3|diameter|average shortest-path length)\b",
+                ql,
+            )
+        ),
     }
 
-    # Visualization notes
-    if flags["viz_full"]:
-        user_payload["notes"].append(
-            "Visualization requested: return top-level plot with highlight_edges='ALL' and highlight_nodes='ALL'."
+
+def extract_src_dst(query: str) -> Tuple[Optional[str], Optional[str]]:
+    q = (query or "").strip()
+    m = re.search(r"\bfrom\s+(M\d+)\s+to\s+(M\d+)\b", q, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper(), m.group(2).upper()
+    m = re.search(r"\bbetween\s+(M\d+)\s+and\s+(M\d+)\b", q, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper(), m.group(2).upper()
+    nodes = [x.upper() for x in _NODE_RE.findall(q)]
+    if len(nodes) >= 2:
+        return nodes[0], nodes[1]
+    return None, None
+
+
+def _path_edges(path: Any) -> List[List[str]]:
+    if not isinstance(path, list) or len(path) < 2:
+        return []
+    out: List[List[str]] = []
+    for i in range(len(path) - 1):
+        out.append([str(path[i]), str(path[i + 1])])
+    return out
+
+
+def _edges_df() -> pd.DataFrame:
+    snap = net.topology_snapshot()
+    edges = snap.get("edges", []) if isinstance(snap, dict) else []
+    df = pd.DataFrame(edges)
+
+    # Normalize common column names
+    if "u" not in df.columns and "source" in df.columns:
+        df["u"] = df["source"]
+    if "v" not in df.columns and "target" in df.columns:
+        df["v"] = df["target"]
+
+    for c in ["u", "v", "link_id", "type", "distance_km"]:
+        if c not in df.columns:
+            df[c] = None
+    return df
+
+
+# ------------------------------ Deterministic handlers ------------------------------
+def _answer_topology(flags: Dict[str, bool]) -> Tuple[Dict[str, Any], Any]:
+    """
+    Return JSON + optional fig.
+    """
+    llm_json: Dict[str, Any] = {"result": {"value": "TOPOLOGY_READY"}}
+    fig = None
+    if flags["viz_any"]:
+        plot_spec = {"title": "Network topology", "highlight_edges": "ALL", "highlight_nodes": "ALL"}
+        try:
+            _, fig = net.render_plot(plot_spec)
+        except Exception:
+            fig = None
+        llm_json["plot"] = plot_spec
+    return llm_json, fig
+
+
+def _answer_paths(query: str, flags: Dict[str, bool]) -> Tuple[Dict[str, Any], Any, pd.DataFrame, pd.DataFrame]:
+    """
+    Deterministic path answering.
+
+    Key fix vs your previous version:
+      - NEVER use highlight_edges="AUTO"
+      - For path-only plots, we explicitly build highlight_edges from the chosen path.
+      - We do NOT rely on query_network_path(..., visualize=True) to avoid full-topology plots.
+    """
+    ql = (query or "").lower()
+    src, dst = extract_src_dst(query)
+    if not src or not dst:
+        return (
+            {"result": {"error": "NO_PATH", "message": "Could not extract SRC/DST from query."}},
+            None,
+            pd.DataFrame(),
+            pd.DataFrame(),
         )
-    if flags["viz_path"]:
-        user_payload["notes"].append(
-            "Visualization requested for a path: return top-level plot with highlight_nodes=path nodes and highlight_edges=only consecutive edges along that path (no ALL)."
+
+    # Helper: get best path row from query_network_path without plotting
+    def _best_path(mode: str) -> Tuple[Optional[List[str]], Optional[float], Optional[int], pd.DataFrame, pd.DataFrame]:
+        fig0, node_df0, link_df0 = net.query_network_path(src, dst, mode=mode, visualize=False)
+        if not isinstance(node_df0, pd.DataFrame) or node_df0.empty:
+            return None, None, None, pd.DataFrame(), pd.DataFrame()
+        row = node_df0.iloc[0].to_dict()
+        path = row.get("Nodes")
+        total_km = row.get("Total Distance (km)")
+        hops = row.get("Hop Count")
+
+        # Normalize
+        if isinstance(path, str):
+            # handle "A → B → C" style
+            parts = [p.strip() for p in path.replace("->", "→").split("→") if p.strip()]
+            path = parts
+        if isinstance(path, tuple):
+            path = list(path)
+
+        try:
+            hops_i = int(hops) if pd.notna(hops) else None
+        except Exception:
+            hops_i = None
+
+        try:
+            total_f = float(total_km) if pd.notna(total_km) else None
+        except Exception:
+            total_f = None
+
+        return path, total_f, hops_i, node_df0, (link_df0 if isinstance(link_df0, pd.DataFrame) else pd.DataFrame())
+
+    # SHORTTEST
+    if "shortest path" in ql:
+        path, total_km, hops, node_df, link_df = _best_path("shortest")
+        if not path:
+            return {"result": {"error": "NO_PATH", "message": "No path returned by Python."}}, None, pd.DataFrame(), pd.DataFrame()
+
+        llm_json: Dict[str, Any] = {
+            "result": {"path": path, "hop_count": hops, "total_distance_km": total_km}
+        }
+
+        fig = None
+        if flags["viz_any"]:
+            edges = _path_edges(path)
+            llm_json["plot"] = {
+                "title": f"Shortest Path: {src} → {dst}",
+                "highlight_nodes": path,
+                "highlight_edges": edges,
+                "only_highlight": bool(flags.get("path_only", False)),
+            }
+            # If user asked for path-only, render only highlighted subgraph; otherwise use the path helper
+            try:
+                if bool(flags.get("path_only", False)):
+                    _, fig = net.render_plot(llm_json["plot"])
+                else:
+                    _, fig = net._visualize_path(path, title=f"Shortest Path: {src} → {dst}", highlight_color="green")
+            except Exception:
+                try:
+                    _, fig = net.render_plot(llm_json["plot"])
+                except Exception:
+                    fig = None
+
+        return llm_json, fig, node_df, link_df
+
+    # LONGEST (accept both "longest simple path" and "longest path")
+    if ("longest simple path" in ql) or ("longest path" in ql):
+        path, total_km, hops, node_df, link_df = _best_path("longest")
+        if not path:
+            return {"result": {"error": "NO_PATH", "message": "No path returned by Python."}}, None, pd.DataFrame(), pd.DataFrame()
+
+        llm_json = {
+            "result": {"path": path, "hop_count": hops, "total_distance_km": total_km}
+        }
+
+        fig = None
+        if flags["viz_any"]:
+            edges = _path_edges(path)
+            llm_json["plot"] = {
+                "title": f"Longest Path: {src} → {dst}",
+                "highlight_nodes": path,
+                "highlight_edges": edges,
+                "only_highlight": bool(flags.get("path_only", False)),
+            }
+            try:
+                if bool(flags.get("path_only", False)):
+                    _, fig = net.render_plot(llm_json["plot"])
+                else:
+                    _, fig = net._visualize_path(path, title=f"Longest Path: {src} → {dst}", highlight_color="red")
+            except Exception:
+                try:
+                    _, fig = net.render_plot(llm_json["plot"])
+                except Exception:
+                    fig = None
+
+        return llm_json, fig, node_df, link_df
+
+    # COUNT ALL SIMPLE PATHS
+    if "list all simple paths" in ql:
+        fig0, node_df, link_df = net.query_network_path(src, dst, mode="all", visualize=False)
+        n = int(len(node_df)) if isinstance(node_df, pd.DataFrame) else 0
+        return {"result": {"value": n}}, None, (node_df if isinstance(node_df, pd.DataFrame) else pd.DataFrame()), (link_df if isinstance(link_df, pd.DataFrame) else pd.DataFrame())
+
+    # FEWEST HOPS
+    if "fewest hops" in ql:
+        fig0, node_df, link_df = net.query_network_path(src, dst, mode="all", visualize=False)
+        if not isinstance(node_df, pd.DataFrame) or node_df.empty:
+            return {"result": {"error": "NO_PATH", "message": "No paths exist."}}, None, pd.DataFrame(), pd.DataFrame()
+
+        # Pick path with minimum hop count (tie-breaker: lower distance)
+        tmp = node_df.copy()
+        tmp["Hop Count"] = pd.to_numeric(tmp["Hop Count"], errors="coerce")
+        tmp["Total Distance (km)"] = pd.to_numeric(tmp["Total Distance (km)"], errors="coerce")
+        tmp = tmp.dropna(subset=["Hop Count"])
+        tmp = tmp.sort_values(["Hop Count", "Total Distance (km)"], ascending=[True, True])
+
+        best = tmp.iloc[0].to_dict()
+        path = best.get("Nodes")
+        if isinstance(path, str):
+            parts = [p.strip() for p in path.replace("->", "→").split("→") if p.strip()]
+            path = parts
+        if isinstance(path, tuple):
+            path = list(path)
+
+        hops = int(best.get("Hop Count")) if pd.notna(best.get("Hop Count")) else None
+
+        llm_json = {"result": {"path": path, "hop_count": hops}}
+
+        fig = None
+        if flags["viz_any"] and isinstance(path, list) and len(path) >= 2:
+            edges = _path_edges(path)
+            llm_json["plot"] = {
+                "title": f"Fewest hops: {src} → {dst}",
+                "highlight_nodes": path,
+                "highlight_edges": edges,
+                "only_highlight": bool(flags.get("path_only", False)),
+            }
+            try:
+                if bool(flags.get("path_only", False)):
+                    _, fig = net.render_plot(llm_json["plot"])
+                else:
+                    _, fig = net._visualize_path(path, title=f"Fewest hops: {src} → {dst}", highlight_color="blue")
+            except Exception:
+                try:
+                    _, fig = net.render_plot(llm_json["plot"])
+                except Exception:
+                    fig = None
+
+        return llm_json, fig, node_df, (link_df if isinstance(link_df, pd.DataFrame) else pd.DataFrame())
+
+    return {"result": {"error": "NOT_IMPLEMENTED"}}, None, pd.DataFrame(), pd.DataFrame()
+
+
+def _answer_graph_stats(query: str) -> Dict[str, Any]:
+    import networkx as nx
+
+    ql = (query or "").lower()
+    deg = dict(net.G.degree())
+    if not deg:
+        return {"result": {"error": "EMPTY_TOPOLOGY"}}
+
+    if "highest degree" in ql:
+        n = max(deg, key=lambda k: deg[k])
+        return {"result": {"node_id": str(n), "degree": int(deg[n])}}
+
+    if "lowest degree" in ql:
+        n = min(deg, key=lambda k: deg[k])
+        return {"result": {"node_id": str(n), "degree": int(deg[n])}}
+
+    if "average node degree" in ql:
+        vals = list(deg.values())
+        return {
+            "result": {
+                "average_degree": float(sum(vals) / len(vals)),
+                "min_degree": int(min(vals)),
+                "max_degree": int(max(vals)),
+            }
+        }
+
+    if "degree 1" in ql:
+        return {"result": {"value": int(sum(1 for v in deg.values() if v == 1))}}
+
+    if "degree >=" in ql:
+        m = re.search(r"degree\s*>=\s*(\d+)", ql)
+        k = int(m.group(1)) if m else 3
+        return {"result": {"value": int(sum(1 for v in deg.values() if v >= k))}}
+
+    if "isolated" in ql:
+        return {"result": {"value": bool(any(v == 0 for v in deg.values()))}}
+
+    if "top 3" in ql:
+        top = sorted(deg.items(), key=lambda kv: (-kv[1], str(kv[0])))[:3]
+        return {"result": {"top_nodes": [{"node_id": str(n), "degree": int(d)} for n, d in top]}}
+
+    if "diameter" in ql:
+        if nx.is_connected(net.G):
+            return {"result": {"value": int(nx.diameter(net.G))}}
+        comps = [net.G.subgraph(c).copy() for c in nx.connected_components(net.G)]
+        d = max(int(nx.diameter(g)) for g in comps if g.number_of_nodes() > 1)
+        return {"result": {"value": d}}
+
+    if "average shortest-path length" in ql:
+        if nx.is_connected(net.G):
+            return {"result": {"value": float(nx.average_shortest_path_length(net.G))}}
+        largest = max(nx.connected_components(net.G), key=len)
+        g = net.G.subgraph(largest).copy()
+        return {"result": {"value": float(nx.average_shortest_path_length(g))}}
+
+    return {"result": {"error": "NOT_IMPLEMENTED"}}
+
+
+def _answer_link_stats(query: str, flags: Dict[str, bool]) -> Dict[str, Any]:
+    ql = (query or "").lower()
+    df = _edges_df()
+
+    m = re.search(r"\b(ml|al)\s+links\s+under\s+(\d+(?:\.\d+)?)\s*km\b", ql)
+    if m:
+        typ = m.group(1).upper()
+        th = float(m.group(2))
+        f = df[
+            (df["type"].astype(str).str.upper() == typ)
+            & (pd.to_numeric(df["distance_km"], errors="coerce") < th)
+        ]
+        rows = (
+            f[["u", "v", "link_id", "type", "distance_km"]]
+            .sort_values("distance_km")
+            .to_dict("records")
         )
-    if flags["random_gen"]:
-        user_payload["notes"].append(
-            "Random topology generation requested: include result.topology_modifications.generate_random_topology with parameters (network_type, num_nodes, avg_degree, min_distance_km, max_distance_km, seed)."
+        return {
+            "result": {"value": int(len(rows))},
+            "tables": [{"name": f"{typ}_links_under_{th}_km", "rows": rows}],
+        }
+
+    m = re.search(r"\baverage\s+(ml|al)\s+link\s+distance\b", ql)
+    if m:
+        typ = m.group(1).upper()
+        f = df[df["type"].astype(str).str.upper() == typ]
+        vals = pd.to_numeric(f["distance_km"], errors="coerce").dropna()
+        return {"result": {"value": float(vals.mean()) if len(vals) else None}}
+
+    if "maximum ml link distance" in ql or ("max" in ql and "ml" in ql and "distance" in ql):
+        f = df[df["type"].astype(str).str.upper() == "ML"].copy()
+        f["distance_km"] = pd.to_numeric(f["distance_km"], errors="coerce")
+        f = f.dropna(subset=["distance_km"])
+        if f.empty:
+            return {"result": {"error": "NO_ML_EDGES"}}
+        row = f.sort_values("distance_km", ascending=False).iloc[0].to_dict()
+        out: Dict[str, Any] = {"result": row}
+        if flags["viz_any"]:
+            out["plot"] = {
+                "title": "Max ML link",
+                "highlight_edges": [[row["u"], row["v"]]],
+                "highlight_nodes": [row["u"], row["v"]],
+            }
+        return out
+
+    if "5 longest links" in ql:
+        f = df.copy()
+        f["distance_km"] = pd.to_numeric(f["distance_km"], errors="coerce")
+        f = f.dropna(subset=["distance_km"])
+        top = f.sort_values("distance_km", ascending=False).head(5)[
+            ["u", "v", "link_id", "type", "distance_km"]
+        ]
+        rows = top.to_dict("records")
+        return {
+            "result": {"value": int(len(rows))},
+            "tables": [{"name": "top_5_longest_links", "rows": rows}],
+        }
+
+    return {"result": {"error": "NOT_IMPLEMENTED"}}
+
+
+def _answer_equipment(query: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    ql = (query or "").lower()
+
+    eqp_mngr.deploy_equipment()
+    s = eqp_mngr.summarize_equipment(visualize=False)
+    node_df = s.get("node_df")
+    link_df = s.get("link_df")
+
+    if not isinstance(node_df, pd.DataFrame):
+        node_df = pd.DataFrame()
+    if not isinstance(link_df, pd.DataFrame):
+        link_df = pd.DataFrame()
+
+    def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+        cols = [c for c in df.columns]
+        for cand in candidates:
+            for c in cols:
+                if cand in c.lower():
+                    return c
+        return None
+
+    node_eq_col = _find_col(node_df, ["equipment", "elements", "deployed"])
+    link_eq_col = _find_col(link_df, ["equipment", "elements", "deployed"])
+
+    # Always return proper tables for "summary table" requests
+    if "summary table" in ql or ("deploy network equipment" in ql and "table" in ql):
+        return (
+            {
+                "result": {"value": "EQUIPMENT_DEPLOYED"},
+                "tables": [
+                    {"name": "node_equipment", "rows": node_df.to_dict("records")},
+                    {"name": "link_equipment", "rows": link_df.to_dict("records")},
+                ],
+            },
+            node_df,
+            link_df,
         )
 
-    if mode == "none":
-        return [
-            {"role": "system", "content": schema_rules},
-            {"role": "user", "content": json.dumps(user_payload)},
-        ]
+    if "how many roadm" in ql:
+        if node_eq_col is None:
+            return ({"result": {"error": "NO_NODE_EQUIPMENT_COLUMN"}}, node_df, link_df)
+        cnt = int(
+            node_df[node_eq_col]
+            .astype(str)
+            .str.contains("ROADM", case=False, na=False)
+            .sum()
+        )
+        return ({"result": {"value": cnt}}, node_df, link_df)
 
-    if mode == "zero-shot":
-        sys = schema_rules + "\nBe concise and deterministic."
-        return [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": json.dumps(user_payload)},
-        ]
+    if "how many trx" in ql or "trx elements" in ql:
+        if node_eq_col is None:
+            return ({"result": {"error": "NO_NODE_EQUIPMENT_COLUMN"}}, node_df, link_df)
+        cnt = int(
+            node_df[node_eq_col]
+            .astype(str)
+            .str.contains("TRX|TRANSCEIVER", case=False, na=False, regex=True)
+            .sum()
+        )
+        return ({"result": {"value": cnt}}, node_df, link_df)
 
-    if mode == "one-shot":
-        sys = schema_rules + "\nFollow the example format."
-        return [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": json.dumps({"user_query": _ONE_SHOT_EXAMPLE["question"], "topology": topology})},
-            {"role": "assistant", "content": json.dumps(_ONE_SHOT_EXAMPLE["answer"])},
-            {"role": "user", "content": json.dumps(user_payload)},
-        ]
+    if "total number of ilas" in ql or "total number of ila" in ql:
+        if link_eq_col is None:
+            return ({"result": {"error": "NO_LINK_EQUIPMENT_COLUMN"}}, node_df, link_df)
+        cnt = int(link_df[link_eq_col].astype(str).str.count("ILA").sum())
+        return ({"result": {"value": cnt}}, node_df, link_df)
 
-    sys = schema_rules + "\nDouble-check your arithmetic."
-    return [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": json.dumps(user_payload)},
-    ]
+    def _links_with(token: str, table_name: str) -> Dict[str, Any]:
+        if link_eq_col is None:
+            return {"result": {"error": "NO_LINK_EQUIPMENT_COLUMN"}}
+        f = link_df[
+            link_df[link_eq_col].astype(str).str.contains(token, case=False, na=False)
+        ].copy()
+        rows = f.to_dict("records")
+        return {"result": {"value": int(len(rows))}, "tables": [{"name": table_name, "rows": rows}]}
+
+    if "links that have an ila" in ql:
+        return (_links_with("ILA", "links_with_ila"), node_df, link_df)
+
+    if "links that have a preamp" in ql:
+        return (_links_with("PREAMP", "links_with_preamp"), node_df, link_df)
+
+    if "links that have an amp" in ql:
+        if link_eq_col is None:
+            return ({"result": {"error": "NO_LINK_EQUIPMENT_COLUMN"}}, node_df, link_df)
+        f = link_df[
+            link_df[link_eq_col].astype(str).str.contains("AMP", case=False, na=False)
+            & ~link_df[link_eq_col].astype(str).str.contains("PREAMP", case=False, na=False)
+        ].copy()
+        rows = f.to_dict("records")
+        return (
+            {"result": {"value": int(len(rows))}, "tables": [{"name": "links_with_amp", "rows": rows}]},
+            node_df,
+            link_df,
+        )
+
+    # Default: still return tables so downstream app/bench can display them
+    return (
+        {
+            "result": {"value": "EQUIPMENT_DEPLOYED"},
+            "tables": [
+                {"name": "node_equipment", "rows": node_df.to_dict("records")},
+                {"name": "link_equipment", "rows": link_df.to_dict("records")},
+            ],
+        },
+        node_df,
+        link_df,
+    )
+
+
+# ------------------------------ LLM fallback prompt ------------------------------
+_SYSTEM_PROMPT = """
+    You are an assistant for optical network analytics.
+
+OUTPUT FORMAT (HARD RULE):
+- Return exactly ONE valid JSON object.
+- No markdown, no code fences, no extra text.
+- Allowed top-level keys ONLY: result, tables, plot.
+- 'plot' MUST be top-level (never nested inside result).
+
+FAIL-INSTEAD-OF-GUESS (HARD RULE):
+- If you cannot answer exactly from the provided payload, return:
+  { "result": { "error": "NOT_IMPLEMENTED" } }
+
+INTERPRETATION PRIORITY (HARD RULE):
+- If the user asks for "shortest path" or "longest path", you MUST produce a path result (or NOT_IMPLEMENTED).
+- If the user also asks to plot, you MUST provide a plot that matches the requested scope.
+
+PLOT CONTRACT:
+- The plot object must be:
+  { "plot": { "title": "...", "highlight_edges": "ALL" or [[u,v],...], "highlight_nodes": "ALL" or [..] } }
+- Do NOT include raw topology data inside plot.
+
+PATH-ONLY VISUALIZATION RULE (HARD RULE):
+- If the user says ANY of: "plot that path only", "only the path", "not the full topology", "do not show full topology",
+  then you MUST NOT use "ALL" for highlight_edges or highlight_nodes.
+- Instead, highlight_edges MUST be an explicit edge list [[u,v], ...] for the chosen path.
+- highlight_nodes MUST be the ordered node list of the chosen path.
+
+TOPOLOGY VISUALIZATION RULE:
+- Use "ALL" ONLY when the user explicitly asks for full topology / entire network / full graph / all links.
+
+DEFAULT TITLE RULES:
+- If shortest path: title = "Shortest Path: <SRC> → <DST>"
+- If longest path:  title = "Longest Path: <SRC> → <DST>"
+- If full topology: title = "Network topology"
+"""
+
+
+def build_messages(query: str) -> List[Dict[str, str]]:
+    payload = {
+        "user_query": query,
+        "topology": net.topology_snapshot(),
+        "note": "Prefer returning NOT_IMPLEMENTED rather than guessing.",
+    }
+    return [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": json.dumps(payload)}]
 
 
 # ------------------------------------ run() ------------------------------------
-def run(query: str, mode: str = "zero-shot", rag_enabled: bool = False) -> Dict[str, Any]:
-    """Run one interactive query."""
+def run(query: str, mode: str = "none", rag_enabled: bool = False) -> Dict[str, Any]:
     global _TOPO_READY
 
     if not _TOPO_READY:
         net.build_topology(use_csv=True, visualize=False)
         _TOPO_READY = True
 
-    if not _is_in_scope(query):
-        oos = {
-            "result": {
-                "error": "OUT_OF_SCOPE",
-                "message": "Only optical network topology/equipment/QoT questions are supported.",
-            }
-        }
-        raw = json.dumps(oos)
-        return {
-            "ok": True,
-            "llm_json": oos,
-            "fig": None,
-            "node_df": None,
-            "link_df": None,
-            "qot_df": None,
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
-            "raw": raw,
-        }
-
     flags = _query_flags(query)
 
-    messages = build_messages(query, mode, rag_enabled)
-    raw, prompt_tokens, completion_tokens, total_tokens = call_llm(messages, mode=mode)
-
-    chat_history.append({"role": "user", "content": query})
-    chat_history.append(
-        {
-            "role": "assistant",
-            "content": raw,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        }
-    )
-
-    try:
-        llm_json = _extract_first_json(raw)
-        ok = True
-    except Exception as e:
-        llm_json = {"result": {"error": "PARSE_ERROR", "message": str(e), "raw": raw[:2000]}}
-        ok = False
-
-    # --- Post-parse sanitation for robustness ---
-    if isinstance(llm_json, dict):
-        res = llm_json.get("result")
-
-        # 1) If model incorrectly nested plot under result, lift it to top-level.
-        if isinstance(res, dict) and isinstance(res.get("plot"), dict) and not isinstance(llm_json.get("plot"), dict):
-            llm_json["plot"] = res.pop("plot")
-
-        # 2) If scalar query, strip plot/tables unless user explicitly requested visualization.
-        if isinstance(res, dict) and "value" in res and flags.get("scalar_hint") and not flags.get("viz_any"):
-            llm_json.pop("plot", None)
-            llm_json.pop("tables", None)
-
-        # 3) If plot contains forbidden heavy keys, drop them.
-        plot = llm_json.get("plot")
-        if isinstance(plot, dict):
-            for forbidden in ["data", "nodes", "edges", "links"]:
-                plot.pop(forbidden, None)
-
-    # Apply requested topology edits BEFORE rendering plot.
-    try:
-        if isinstance(llm_json, dict) and isinstance(llm_json.get("result"), dict):
-            edits = llm_json["result"].get("graph_edits") or llm_json["result"].get("topology_modifications")
-            if isinstance(edits, dict):
-                net.apply_graph_edits(edits)
-    except Exception:
-        pass
-
-    # Optional plot
+    llm_json: Dict[str, Any] = {"result": {"error": "NOT_IMPLEMENTED"}}
     fig = None
-    plot = llm_json.get("plot") if isinstance(llm_json, dict) else None
-    if isinstance(plot, dict):
-        try:
-            _, fig = net.render_plot(plot)
-        except Exception:
-            fig = None
-
-    # Tables (optional)
     node_df = link_df = qot_df = None
+    prompt_tokens = completion_tokens = total_tokens = None
+    raw = ""
+    ok = True
+
+    try:
+        if flags["equip"]:
+            llm_json, node_df, link_df = _answer_equipment(query)
+            raw = json.dumps(llm_json)
+
+        elif flags["path"]:
+            llm_json, fig, node_df, link_df = _answer_paths(query, flags)
+            raw = json.dumps(llm_json)
+
+
+        elif flags["topology"]:
+            llm_json, fig = _answer_topology(flags)
+            raw = json.dumps(llm_json)
+
+
+        elif flags["graph_stats"]:
+            llm_json = _answer_graph_stats(query)
+            raw = json.dumps(llm_json)
+
+        elif flags["link_stats"]:
+            llm_json = _answer_link_stats(query, flags)
+            raw = json.dumps(llm_json)
+
+        else:
+            messages = build_messages(query)
+            raw, prompt_tokens, completion_tokens, total_tokens = call_llm(messages)
+            llm_json = _extract_first_json(raw)
+
+    except Exception as e:
+        ok = False
+        llm_json = {"result": {"error": "PARSE_ERROR", "message": str(e), "raw": (raw or "")[:2000]}}
+        raw = json.dumps(llm_json)
+
+    # If we didn't already compute fig directly, render via plot spec
+    if fig is None:
+        plot = llm_json.get("plot") if isinstance(llm_json, dict) else None
+        if isinstance(plot, dict):
+            try:
+                _, fig = net.render_plot(plot)
+            except Exception:
+                fig = None
+
+    # Tables into DFs (so app + benchmark can show them)
     tables = llm_json.get("tables") if isinstance(llm_json, dict) else None
     if isinstance(tables, list):
         for t in tables:
@@ -624,7 +768,7 @@ def run(query: str, mode: str = "zero-shot", rag_enabled: bool = False) -> Dict[
                 qot_df = df
 
     return {
-        "ok": ok,
+        "ok": ok and isinstance(llm_json, dict),
         "llm_json": llm_json,
         "fig": fig,
         "node_df": node_df,
@@ -635,49 +779,3 @@ def run(query: str, mode: str = "zero-shot", rag_enabled: bool = False) -> Dict[
         "total_tokens": total_tokens,
         "raw": raw,
     }
-
-
-# ------------------------------ Benchmarking ------------------------------
-def benchmark_models(models: List[str], queries: List[str], rag_enabled: bool = False) -> pd.DataFrame:
-    rows: List[dict] = []
-    for m in models:
-        set_model(m)
-        for q in queries:
-            for mode in ["none", "zero-shot", "one-shot", "few-shot"]:
-                _reset_state()
-                t0 = time.time()
-                gpu_before, _ = read_gpu_usage()
-                out = run(q, mode=mode, rag_enabled=rag_enabled)
-                latency = (time.time() - t0) * 1000.0
-                gpu_after, gpu_util = read_gpu_usage()
-                cpu, mem = read_cpu_usage()
-
-                success = int(bool(out.get("ok")))
-
-                rows.append(
-                    {
-                        "model": m,
-                        "mode": mode,
-                        "rag": int(bool(rag_enabled)),
-                        "query": q,
-                        "success": success,
-                        "latency_ms": round(latency, 2),
-                        "prompt_tokens": out.get("prompt_tokens"),
-                        "completion_tokens": out.get("completion_tokens"),
-                        "total_tokens": out.get("total_tokens"),
-                        "gpu_power_w_before": gpu_before,
-                        "gpu_power_w_after": gpu_after,
-                        "gpu_util_percent": gpu_util,
-                        "cpu_percent": cpu,
-                        "mem_percent": mem,
-                        "raw_output": out.get("raw"),
-                    }
-                )
-
-    return pd.DataFrame(rows)
-
-
-def run_experiment_from_yaml(models: List[str], yaml_file: str = "questions.yaml", rag_enabled: bool = False) -> pd.DataFrame:
-    queries = load_benchmark_queries_from_yaml(yaml_file)
-    return benchmark_models(models=models, queries=queries, rag_enabled=rag_enabled)
-
