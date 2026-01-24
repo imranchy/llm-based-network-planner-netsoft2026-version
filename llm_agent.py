@@ -1,21 +1,21 @@
 """llm_agent.py
 
-NetSoft 2026 edition — Hybrid LLM + Python analytics
----------------------------------------------------
+Hybrid deterministic network analytics + strict-JSON LLM fallback.
 
-- Python performs deterministic computations:
-  * topology build (from CSV)
-  * shortest path / longest simple path / all simple paths count
-  * fewest-hop path
-  * graph metrics (degrees, diameter, average shortest path length)
-  * link statistics (filters, averages, top-k)
-  * equipment deployment + summary tables
+Deterministic handlers cover:
+- topology build from CSV (+ optional visualization)
+- shortest path (Dijkstra), fewest hops (BFS)
+- longest path policy: longest simple path within hop cutoff
+  * If user doesn't specify cutoff, uses max(12, 2 * shortest_hops)
+- bounded all-paths listing (within hop cutoff)
+- graph stats (degree stats, isolated, average shortest-path length in hops)
+- link stats (ML/AL filters, averages, max, top-k)
+- equipment deployment + summaries and counts
+- propagation delay & fiber-type comparisons (uses qot_utils.calc_qot_metrics)
+- ILA-constrained routing (min ILAs, paths containing edges with ILA threshold)
+- HCF upgrade recommendation (heuristic)
 
-- The LLM is a fallback for anything not covered.
-
-Expected files in project root:
-  - distance.csv
-  - city.csv
+The LLM is used only as a strict-JSON fallback for unsupported queries.
 """
 
 from __future__ import annotations
@@ -24,12 +24,22 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import ollama
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+import networkx as nx
+try:
+    import ollama  # type: ignore
+except Exception:  # ollama python package may be missing
+    ollama = None
 import pandas as pd
 import psutil
 
 from equipment_manager import EquipmentManager
 from graph_processor import NetworkGraph
+from qot_utils import calc_qot_metrics
+from graph_utils import resolve_nodes
 
 # ------------------------------ Model registry ------------------------------
 VALID_MODELS = {
@@ -41,7 +51,6 @@ VALID_MODELS = {
 
 _ACTIVE_MODEL = "qwen2.5:14b-instruct"
 
-
 def set_model(name: str) -> None:
     global _ACTIVE_MODEL
     if name not in VALID_MODELS:
@@ -50,35 +59,36 @@ def set_model(name: str) -> None:
         )
     _ACTIVE_MODEL = name
 
-
 def get_model() -> str:
     return _ACTIVE_MODEL
 
-
 # ------------------------------ Shared state ------------------------------
-net = NetworkGraph("distance.csv", "city.csv")
+net = NetworkGraph(os.path.join(BASE_DIR,"distance.csv"), os.path.join(BASE_DIR,"city.csv"))
 eqp_mngr = EquipmentManager(net)
-_TOPO_READY = False
-
+_TOPO_READY = True
+_EQUIP_READY = False
 
 def _reset_state() -> None:
-    """Reset global state between runs/benchmarks for fair comparisons."""
-    global _TOPO_READY, net, eqp_mngr
-    _TOPO_READY = False
-    net = NetworkGraph("distance.csv", "city.csv")
+    global _TOPO_READY, _EQUIP_READY, net, eqp_mngr
+    net = NetworkGraph(os.path.join(BASE_DIR,"distance.csv"), os.path.join(BASE_DIR,"city.csv"))
     eqp_mngr = EquipmentManager(net)
+    _TOPO_READY = True
+    _EQUIP_READY = False
 
+def _ensure_equipment() -> None:
+    global _EQUIP_READY
+    if not _EQUIP_READY:
+        eqp_mngr.deploy_equipment()
+        _EQUIP_READY = True
 
-# --------------------------- CPU / RAM / GPU logging ---------------------------
+# --------------------------- CPU / RAM / GPU logging (optional) ---------------------------
 _NVML = {"ok": False, "h": None}
-
 
 def _nvml_init_once() -> None:
     if _NVML["ok"]:
         return
     try:
         import pynvml
-
         pynvml.nvmlInit()
         _NVML["h"] = pynvml.nvmlDeviceGetHandleByIndex(0)
         _NVML["ok"] = True
@@ -86,11 +96,9 @@ def _nvml_init_once() -> None:
         _NVML["ok"] = False
         _NVML["h"] = None
 
-
 def read_gpu_usage() -> Tuple[Optional[float], Optional[float]]:
     try:
         import pynvml
-
         _nvml_init_once()
         if not _NVML["ok"] or _NVML["h"] is None:
             return None, None
@@ -101,7 +109,6 @@ def read_gpu_usage() -> Tuple[Optional[float], Optional[float]]:
     except Exception:
         return None, None
 
-
 def read_cpu_usage() -> Tuple[Optional[float], Optional[float]]:
     try:
         cpu_percent = float(psutil.cpu_percent(interval=None))
@@ -110,30 +117,62 @@ def read_cpu_usage() -> Tuple[Optional[float], Optional[float]]:
     except Exception:
         return None, None
 
-
 # ------------------------------ Ollama call ------------------------------
-_DEF_SEED = 12345
-
+_DEF_SEED = 42
 
 def _decode_options() -> dict:
-    # Deterministic benchmarking-friendly options
-    return {"seed": _DEF_SEED, "top_p": 1.0, "temperature": 0.0, "num_predict": 500}
-
+    return {"seed": _DEF_SEED, "top_p": 1.0, "temperature": 0.0, "num_predict": 700}
 
 def call_llm(messages: List[Dict[str, str]]) -> Tuple[str, Optional[int], Optional[int], Optional[int]]:
-    r = ollama.chat(model=_ACTIVE_MODEL, messages=messages, options=_decode_options())
-    content = (r["message"]["content"] or "").strip()
-    prompt_tokens = r.get("prompt_eval_count")
-    completion_tokens = r.get("eval_count")
+    """Call Ollama.
+
+    Uses the `ollama` Python package when available; otherwise falls back to the local HTTP API
+    (default Ollama endpoint: http://127.0.0.1:11434).
+    """
+    opts = _decode_options()
+
+    # Preferred: python package
+    if ollama is not None:
+        r = ollama.chat(model=_ACTIVE_MODEL, messages=messages, options=opts)
+        content = (r["message"]["content"] or "").strip()
+        prompt_tokens = r.get("prompt_eval_count")
+        completion_tokens = r.get("eval_count")
+        total_tokens = None
+        if prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
+        return content, prompt_tokens, completion_tokens, total_tokens
+
+    # Fallback: local HTTP API
+    import json as _json
+    import urllib.request
+
+    payload = _json.dumps(
+        {"model": _ACTIVE_MODEL, "messages": messages, "options": opts, "stream": False}
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        "http://127.0.0.1:11434/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        data = _json.loads(resp.read().decode("utf-8"))
+
+    msg = (data.get("message") or {}).get("content") or ""
+    content = str(msg).strip()
+
+    # HTTP API may expose token counts under `prompt_eval_count` / `eval_count` as well
+    prompt_tokens = data.get("prompt_eval_count")
+    completion_tokens = data.get("eval_count")
     total_tokens = None
     if prompt_tokens is not None and completion_tokens is not None:
-        total_tokens = prompt_tokens + completion_tokens
-    return content, prompt_tokens, completion_tokens, total_tokens
+        total_tokens = int(prompt_tokens) + int(completion_tokens)
 
+    return content, prompt_tokens, completion_tokens, total_tokens
 
 # ------------------------------ JSON extraction ------------------------------
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
-
 
 def _extract_first_json(text: str) -> Dict[str, Any]:
     cleaned = (text or "").strip()
@@ -144,10 +183,67 @@ def _extract_first_json(text: str) -> Dict[str, Any]:
         raise ValueError("No JSON object found in model response")
     return json.loads(m.group(0))
 
-
 # ------------------------------ Query flags / parsing ------------------------------
-_NODE_RE = re.compile(r"\b(M\d+)\b", re.IGNORECASE)
+# ------------------------------ LLM planning (LLM-first) ------------------------------
+# The model decides the intent + parameters, then Python executes deterministically.
 
+_INTENTS = {
+    "TOPOLOGY_BUILD",
+    "SHORTEST_PATH",
+    "FEWEST_HOPS",
+    "LONGEST_PATH",
+    "ALL_PATHS",
+    "GRAPH_STATS",
+    "LINK_STATS",
+    "EQUIPMENT",
+    "PROP_DELAY",
+    "FIBER_CHOICE",
+    "HCF_UPGRADE",
+    "ILA_MIN_ROUTE",
+    "ILA_THRESH_PATHS",
+}
+
+def _llm_disabled() -> bool:
+    return str(os.environ.get("OLLAMA_DISABLE", "")).strip().lower() in {"1","true","yes","on"}
+
+def llm_plan(query: str) -> Optional[Dict[str, Any]]:
+    """Ask the selected Ollama model for a strict JSON plan."""
+    if _llm_disabled():
+        return None
+
+    sys = (
+        "You are a router for a network analytics app. "
+        "Return ONLY one JSON object (no markdown, no backticks). "
+        "Choose intent from this list: "
+        + ", ".join(sorted(_INTENTS))
+        + ". "
+        "Extract src/dst nodes for path questions. "
+        "Set visualize=true if user asks to plot/draw/visualize; otherwise false. "
+        "Set path_only=true only when user asks to plot only the path. "
+        "If a question is about ML/AL links, set link_type to 'ML' or 'AL'. "
+        "If a threshold is mentioned (e.g., ILAs >= 4, links under 5 km), set threshold/distance_km. "
+        "If top-k is requested, set k."
+    )
+    user = "Question: " + (query or "").strip()
+
+    try:
+        raw, *_ = call_llm([{"role":"system","content":sys},{"role":"user","content":user}])
+        plan = _extract_first_json(raw)
+        if not isinstance(plan, dict):
+            return None
+        intent = str(plan.get("intent","")).strip().upper()
+        if intent not in _INTENTS:
+            return None
+        for bkey in ("visualize","path_only","want_table"):
+            if bkey in plan:
+                plan[bkey] = bool(plan[bkey])
+        if "link_type" in plan and plan["link_type"] is not None:
+            lt = str(plan["link_type"]).upper().strip()
+            if lt in {"ML","AL"}:
+                plan["link_type"] = lt
+        return plan
+    except Exception:
+        return None
 
 def _query_flags(q: str) -> Dict[str, bool]:
     ql = (q or "").lower()
@@ -155,269 +251,272 @@ def _query_flags(q: str) -> Dict[str, bool]:
     no_plot = bool(re.search(r"\b(no plot|no visualization|without visualization)\b", ql))
     viz_any = bool(re.search(r"\b(plot|draw|visuali[sz]e|render)\b", ql)) and not no_plot
 
-    path_only = bool(re.search(r"\b(path only|only the path|not the full topology|not the topology|do not show full topology)\b", ql))
-
-    # IMPORTANT: include "longest path" (not only "longest simple path")
-    path_intent = bool(
-        re.search(
-            r"\b(shortest path|longest simple path|longest path|list all simple paths|fewest hops)\b",
-            ql,
-        )
-    )
+    # Normalize unicode comparisons
+    ql_norm = ql.replace("≥", ">=").replace("≤", "<=")
 
     return {
         "no_plot": no_plot,
         "viz_any": viz_any,
-        "path_only": path_only,
-        "equip": bool(re.search(r"\b(deploy|equipment|roadm|trx|ila|preamp|amp)\b", ql)),
-        "path": path_intent,
-        "topology": bool(re.search(r"\b(topology|from csv|csv files?)\b", ql)),
-        "link_stats": bool(
-            re.search(
-                r"\b(ml links|al links|longest links|average .* link distance|max .* link distance|maximum .* link distance)\b",
-                ql,
-            )
-        ),
-        "graph_stats": bool(
-            re.search(
-                r"\b(highest degree|lowest degree|average node degree|degree 1|degree >=|isolated|top 3|diameter|average shortest-path length)\b",
-                ql,
-            )
-        ),
-    }
+        "path_only": bool(re.search(r"\b(path only|only the path|plot that path only|not the full topology|not the topology)\b", ql_norm)),
 
+        "topology": bool(re.search(r"\b(create|build|draw|visualize)\b.*\b(topology|network)\b|\bfrom csv\b|\bcsv files?\b", ql_norm)),
+
+        "path": bool(re.search(r"\b(shortest path|longest path|fewest hops|list all paths|all paths)\b", ql_norm)),
+
+        "graph_stats": bool(re.search(r"(highest degree|lowest degree|average node degree|degree 1|degree\s*(?:>=|>|=|≥)\s*\d+|isolated|top 3|average shortest[- ]path length|diameter)", ql_norm)),
+
+        "link_stats": bool(re.search(r"\b(ml links|al links|average .* link distance|average ml|average al|max(?:imum)? ml|longest links|\d+ longest links|top \d+ longest)\b", ql_norm)),
+
+        "equip": bool(re.search(r"\b(deploy|equipment|roadm|trx|ila|preamp|amp)\b", ql_norm)),
+
+        "delay": bool(re.search(r"\b(propagation delay|delay|latency)\b", ql_norm)),
+        "fiber_choice": bool(re.search(r"\b(which fiber|fiber type|min(imum)? delay|hcf|ssmf)\b", ql_norm)),
+        "hcf_upgrade": bool(re.search(r"\bhcf\b.*\b(only|\d+)\b.*\blinks\b|\bdeploy\s+hcf\b|\bplace\s+hcf\b", ql_norm)),
+
+        "ila_min": bool(re.search(r"\b(minimum(?:\s+number\s+of)?\s+ilas|minimize\s+ilas|fewest\s+ilas|min\s+ilas)\b", ql_norm)),
+        "ila_thresh": bool(re.search(r"\b(?:ilas|ila)\s*(?:>=|≥)\s*\d+\b", ql_norm)),
+
+        "distance_labels": bool(re.search(r"\b(label each link|label each edge|with distances)\b", ql_norm)),
+    }
+def _clean_endpoint(s: str) -> str:
+    s = (s or "").strip().strip('"').strip("'").strip()
+    s = s.split(",")[0].strip()
+    s = re.split(r"\s*[\(\[]", s, maxsplit=1)[0].strip()
+    s = re.split(r"\s+and\s+(?:plot|draw|render|visuali[sz]e|show|return|list|count|compute|calculate)\b", s, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    s = re.split(r"\s+(?:plot|draw|render|visuali[sz]e|show|return|list|count|compute|calculate)\b", s, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    s = re.split(r"\s+by\s+.*$", s, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    return s.strip(" .?;,:")
 
 def extract_src_dst(query: str) -> Tuple[Optional[str], Optional[str]]:
     q = (query or "").strip()
-    m = re.search(r"\bfrom\s+(M\d+)\s+to\s+(M\d+)\b", q, flags=re.IGNORECASE)
+
+    # from X to Y ...
+    m = re.search(
+        r"\bfrom\s+(.+?)\s+to\s+(.+?)(?=\s+and\s+(?:plot|draw|render|visuali[sz]e|show|return|list|count|compute|calculate)\b|[\?\.]?$|\s*$)",
+        q,
+        flags=re.IGNORECASE,
+    )
     if m:
-        return m.group(1).upper(), m.group(2).upper()
-    m = re.search(r"\bbetween\s+(M\d+)\s+and\s+(M\d+)\b", q, flags=re.IGNORECASE)
+        a = _clean_endpoint(m.group(1))
+        b = _clean_endpoint(m.group(2))
+        if re.fullmatch(r"M\d+", a, flags=re.IGNORECASE):
+            a = a.upper()
+        if re.fullmatch(r"M\d+", b, flags=re.IGNORECASE):
+            b = b.upper()
+        return a, b
+
+    # between X and Y ... [stop before "and plot/return/..."]
+    m = re.search(
+        r"\bbetween\s+(.+?)\s+and\s+(.+?)(?=\s+and\s+(?:plot|draw|render|visuali[sz]e|show|return|list|count|compute|calculate)\b|[\?\.]?$|\s*$)",
+        q,
+        flags=re.IGNORECASE,
+    )
     if m:
-        return m.group(1).upper(), m.group(2).upper()
-    nodes = [x.upper() for x in _NODE_RE.findall(q)]
-    if len(nodes) >= 2:
-        return nodes[0], nodes[1]
+        a = _clean_endpoint(m.group(1))
+        b = _clean_endpoint(m.group(2))
+        if re.fullmatch(r"M\d+", a, flags=re.IGNORECASE):
+            a = a.upper()
+        if re.fullmatch(r"M\d+", b, flags=re.IGNORECASE):
+            b = b.upper()
+        return a, b
+
+    # fallback: match any node names mentioned in query
+    ql = q.lower()
+    hits: List[str] = []
+    for n in net.G.nodes():
+        ns = str(n)
+        if ns.lower() in ql:
+            hits.append(ns)
+    if len(hits) >= 2:
+        return hits[0], hits[1]
+
     return None, None
 
+def _parse_max_hops(query: str) -> Optional[int]:
+    ql = (query or "").lower().replace("≥", ">=")
+    m = re.search(r"\b(?:within|max(?:imum)?|at most)\s*(\d{1,3})\s*hops\b", ql)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
 
-def _path_edges(path: Any) -> List[List[str]]:
+def _path_edges(path: List[Any]) -> List[List[str]]:
     if not isinstance(path, list) or len(path) < 2:
         return []
-    out: List[List[str]] = []
-    for i in range(len(path) - 1):
-        out.append([str(path[i]), str(path[i + 1])])
-    return out
+    return [[str(path[i]), str(path[i + 1])] for i in range(len(path) - 1)]
 
+def _path_total_distance_km(path: List[str]) -> float:
+    total = 0.0
+    for u, v in zip(path, path[1:]):
+        data = net.G.get_edge_data(u, v) or {}
+        w = data.get("weight", 0.0)
+        try:
+            total += float(w)
+        except Exception:
+            pass
+    return float(total)
 
 def _edges_df() -> pd.DataFrame:
-    snap = net.topology_snapshot()
-    edges = snap.get("edges", []) if isinstance(snap, dict) else []
-    df = pd.DataFrame(edges)
-
-    # Normalize common column names
-    if "u" not in df.columns and "source" in df.columns:
-        df["u"] = df["source"]
-    if "v" not in df.columns and "target" in df.columns:
-        df["v"] = df["target"]
-
-    for c in ["u", "v", "link_id", "type", "distance_km"]:
-        if c not in df.columns:
-            df[c] = None
-    return df
-
+    rows = []
+    for u, v, d in net.G.edges(data=True):
+        link_id = str(d.get("link_id") or "")
+        dist = d.get("weight")
+        try:
+            dist = float(dist)
+        except Exception:
+            dist = None
+        typ = str(d.get("type") or "").upper()
+        inferred = ""
+        m = re.match(r"^(ML|AL)", link_id.upper())
+        if m:
+            inferred = m.group(1)
+        if typ not in {"ML", "AL"}:
+            typ = inferred or typ
+        rows.append({"u": str(u), "v": str(v), "link_id": link_id, "type": typ, "distance_km": dist})
+    return pd.DataFrame(rows)
 
 # ------------------------------ Deterministic handlers ------------------------------
 def _answer_topology(flags: Dict[str, bool]) -> Tuple[Dict[str, Any], Any]:
-    """
-    Return JSON + optional fig.
-    """
-    llm_json: Dict[str, Any] = {"result": {"value": "TOPOLOGY_READY"}}
+    out: Dict[str, Any] = {"result": {"value": "TOPOLOGY_READY"}}
     fig = None
-    if flags["viz_any"]:
-        plot_spec = {"title": "Network topology", "highlight_edges": "ALL", "highlight_nodes": "ALL"}
-        try:
-            _, fig = net.render_plot(plot_spec)
-        except Exception:
-            fig = None
-        llm_json["plot"] = plot_spec
-    return llm_json, fig
-
+    if flags["viz_any"] and not flags["no_plot"]:
+        out["plot"] = {
+            "title": "Network topology",
+            "highlight_edges": "ALL",
+            "highlight_nodes": "ALL",
+            "only_highlight": False,
+            "show_edge_labels": bool(flags.get("distance_labels", False)),
+            "label_font_size": 6,
+            "edge_label_font_size": 6,
+        }
+        _, fig = net.render_plot(out["plot"])
+    return out, fig
 
 def _answer_paths(query: str, flags: Dict[str, bool]) -> Tuple[Dict[str, Any], Any, pd.DataFrame, pd.DataFrame]:
-    """
-    Deterministic path answering.
-
-    Key fix vs your previous version:
-      - NEVER use highlight_edges="AUTO"
-      - For path-only plots, we explicitly build highlight_edges from the chosen path.
-      - We do NOT rely on query_network_path(..., visualize=True) to avoid full-topology plots.
-    """
-    ql = (query or "").lower()
+    ql = (query or "").lower().replace("≥", ">=")
     src, dst = extract_src_dst(query)
     if not src or not dst:
-        return (
-            {"result": {"error": "NO_PATH", "message": "Could not extract SRC/DST from query."}},
-            None,
-            pd.DataFrame(),
-            pd.DataFrame(),
-        )
+        return {"result": {"error": "NO_PATH", "message": "Could not extract SRC/DST from query."}}, None, pd.DataFrame(), pd.DataFrame()
 
-    # Helper: get best path row from query_network_path without plotting
-    def _best_path(mode: str) -> Tuple[Optional[List[str]], Optional[float], Optional[int], pd.DataFrame, pd.DataFrame]:
-        fig0, node_df0, link_df0 = net.query_network_path(src, dst, mode=mode, visualize=False)
-        if not isinstance(node_df0, pd.DataFrame) or node_df0.empty:
-            return None, None, None, pd.DataFrame(), pd.DataFrame()
-        row = node_df0.iloc[0].to_dict()
-        path = row.get("Nodes")
-        total_km = row.get("Total Distance (km)")
-        hops = row.get("Hop Count")
+    a, b = resolve_nodes(net.G, src, dst)
 
-        # Normalize
-        if isinstance(path, str):
-            # handle "A → B → C" style
-            parts = [p.strip() for p in path.replace("->", "→").split("→") if p.strip()]
-            path = parts
-        if isinstance(path, tuple):
-            path = list(path)
+    mode: Optional[str] = None
+    if re.search(r"\bshortest\b", ql):
+        mode = "shortest"
+    elif re.search(r"\bfewest\s+hops\b", ql):
+        mode = "fewest_hops"
+    elif re.search(r"\blongest\b", ql):
+        mode = "longest"
+    elif re.search(r"\blist\s+all\s+paths\b|\ball\s+paths\b", ql):
+        mode = "all"
 
+    if mode is None:
+        return {"result": {"error": "NOT_IMPLEMENTED"}}, None, pd.DataFrame(), pd.DataFrame()
+
+    fig = None
+
+    if mode == "shortest":
         try:
-            hops_i = int(hops) if pd.notna(hops) else None
+            path = nx.dijkstra_path(net.G, source=a, target=b, weight="weight")
         except Exception:
-            hops_i = None
+            return {"result": {"error": "NO_PATH", "message": f"No path found between {src} and {dst}."}}, None, pd.DataFrame(), pd.DataFrame()
 
-        try:
-            total_f = float(total_km) if pd.notna(total_km) else None
-        except Exception:
-            total_f = None
+        total_km = _path_total_distance_km(path)
+        out = {"result": {"path": path, "hop_count": len(path) - 1, "total_distance_km": round(total_km, 6)}}
 
-        return path, total_f, hops_i, node_df0, (link_df0 if isinstance(link_df0, pd.DataFrame) else pd.DataFrame())
-
-    # SHORTTEST
-    if "shortest path" in ql:
-        path, total_km, hops, node_df, link_df = _best_path("shortest")
-        if not path:
-            return {"result": {"error": "NO_PATH", "message": "No path returned by Python."}}, None, pd.DataFrame(), pd.DataFrame()
-
-        llm_json: Dict[str, Any] = {
-            "result": {"path": path, "hop_count": hops, "total_distance_km": total_km}
-        }
-
-        fig = None
-        if flags["viz_any"]:
-            edges = _path_edges(path)
-            llm_json["plot"] = {
+        if flags["viz_any"] and not flags["no_plot"]:
+            out["plot"] = {
                 "title": f"Shortest Path: {src} → {dst}",
                 "highlight_nodes": path,
-                "highlight_edges": edges,
-                "only_highlight": bool(flags.get("path_only", False)),
+                "highlight_edges": _path_edges(path),
+                "only_highlight": True,
+                "path_only": True,
+                "highlight_only": True,
+                "show_edge_labels": False,
+                "label_font_size": 7,
             }
-            # If user asked for path-only, render only highlighted subgraph; otherwise use the path helper
-            try:
-                if bool(flags.get("path_only", False)):
-                    _, fig = net.render_plot(llm_json["plot"])
-                else:
-                    _, fig = net._visualize_path(path, title=f"Shortest Path: {src} → {dst}", highlight_color="green")
-            except Exception:
-                try:
-                    _, fig = net.render_plot(llm_json["plot"])
-                except Exception:
-                    fig = None
+            _, fig = net.render_plot(out["plot"])
+        return out, fig, pd.DataFrame([{"Nodes": path, "Hop Count": len(path) - 1, "Total Distance (km)": total_km}]), pd.DataFrame()
 
-        return llm_json, fig, node_df, link_df
+    if mode == "fewest_hops":
+        try:
+            path = nx.shortest_path(net.G, source=a, target=b)
+        except Exception:
+            return {"result": {"error": "NO_PATH", "message": f"No path found between {src} and {dst}."}}, None, pd.DataFrame(), pd.DataFrame()
+        total_km = _path_total_distance_km(path)
+        out = {"result": {"path": path, "hop_count": len(path) - 1}}
+        if flags["viz_any"] and not flags["no_plot"]:
+            out["plot"] = {
+                "title": f"Fewest Hops: {src} → {dst}",
+                "highlight_nodes": path,
+                "highlight_edges": _path_edges(path),
+                "only_highlight": True,
+                "path_only": True,
+                "highlight_only": True,
+                "show_edge_labels": False,
+                "label_font_size": 7,
+            }
+            _, fig = net.render_plot(out["plot"])
+        return out, fig, pd.DataFrame([{"Nodes": path, "Hop Count": len(path) - 1, "Total Distance (km)": total_km}]), pd.DataFrame()
 
-    # LONGEST (accept both "longest simple path" and "longest path")
-    if ("longest simple path" in ql) or ("longest path" in ql):
-        path, total_km, hops, node_df, link_df = _best_path("longest")
-        if not path:
-            return {"result": {"error": "NO_PATH", "message": "No path returned by Python."}}, None, pd.DataFrame(), pd.DataFrame()
+    # longest / all: bounded simple paths
+    user_hops = _parse_max_hops(query)
+    try:
+        shortest_hops = len(nx.shortest_path(net.G, source=a, target=b)) - 1
+    except Exception:
+        return {"result": {"error": "NO_PATH", "message": f"No path found between {src} and {dst}."}}, None, pd.DataFrame(), pd.DataFrame()
 
-        llm_json = {
-            "result": {"path": path, "hop_count": hops, "total_distance_km": total_km}
+    max_hops = user_hops if user_hops is not None else max(12, 2 * shortest_hops)
+
+    # enumerate bounded simple paths
+    paths = []
+    for p in nx.all_simple_paths(net.G, source=a, target=b, cutoff=max_hops):
+        paths.append(list(p))
+
+    if not paths:
+        return {"result": {"error": "NO_PATH", "message": f"No paths found within {max_hops} hops."}}, None, pd.DataFrame(), pd.DataFrame()
+
+    if mode == "all":
+        out = {"result": {"count": len(paths), "max_hops": max_hops, "paths": paths}}
+        return out, None, pd.DataFrame(), pd.DataFrame()
+
+    # mode == longest
+    best = None
+    best_dist = None
+    for p in paths:
+        d = _path_total_distance_km(p)
+        if best_dist is None or d > best_dist:
+            best_dist = d
+            best = p
+
+    assert best is not None and best_dist is not None
+    out = {
+        "result": {
+            "path": best,
+            "hop_count": len(best) - 1,
+            "total_distance_km": round(float(best_dist), 6),
+            "max_hops": int(max_hops),
+            "note": "Longest path computed among simple paths with hop_count <= max_hops.",
         }
-
-        fig = None
-        if flags["viz_any"]:
-            edges = _path_edges(path)
-            llm_json["plot"] = {
-                "title": f"Longest Path: {src} → {dst}",
-                "highlight_nodes": path,
-                "highlight_edges": edges,
-                "only_highlight": bool(flags.get("path_only", False)),
-            }
-            try:
-                if bool(flags.get("path_only", False)):
-                    _, fig = net.render_plot(llm_json["plot"])
-                else:
-                    _, fig = net._visualize_path(path, title=f"Longest Path: {src} → {dst}", highlight_color="red")
-            except Exception:
-                try:
-                    _, fig = net.render_plot(llm_json["plot"])
-                except Exception:
-                    fig = None
-
-        return llm_json, fig, node_df, link_df
-
-    # COUNT ALL SIMPLE PATHS
-    if "list all simple paths" in ql:
-        fig0, node_df, link_df = net.query_network_path(src, dst, mode="all", visualize=False)
-        n = int(len(node_df)) if isinstance(node_df, pd.DataFrame) else 0
-        return {"result": {"value": n}}, None, (node_df if isinstance(node_df, pd.DataFrame) else pd.DataFrame()), (link_df if isinstance(link_df, pd.DataFrame) else pd.DataFrame())
-
-    # FEWEST HOPS
-    if "fewest hops" in ql:
-        fig0, node_df, link_df = net.query_network_path(src, dst, mode="all", visualize=False)
-        if not isinstance(node_df, pd.DataFrame) or node_df.empty:
-            return {"result": {"error": "NO_PATH", "message": "No paths exist."}}, None, pd.DataFrame(), pd.DataFrame()
-
-        # Pick path with minimum hop count (tie-breaker: lower distance)
-        tmp = node_df.copy()
-        tmp["Hop Count"] = pd.to_numeric(tmp["Hop Count"], errors="coerce")
-        tmp["Total Distance (km)"] = pd.to_numeric(tmp["Total Distance (km)"], errors="coerce")
-        tmp = tmp.dropna(subset=["Hop Count"])
-        tmp = tmp.sort_values(["Hop Count", "Total Distance (km)"], ascending=[True, True])
-
-        best = tmp.iloc[0].to_dict()
-        path = best.get("Nodes")
-        if isinstance(path, str):
-            parts = [p.strip() for p in path.replace("->", "→").split("→") if p.strip()]
-            path = parts
-        if isinstance(path, tuple):
-            path = list(path)
-
-        hops = int(best.get("Hop Count")) if pd.notna(best.get("Hop Count")) else None
-
-        llm_json = {"result": {"path": path, "hop_count": hops}}
-
-        fig = None
-        if flags["viz_any"] and isinstance(path, list) and len(path) >= 2:
-            edges = _path_edges(path)
-            llm_json["plot"] = {
-                "title": f"Fewest hops: {src} → {dst}",
-                "highlight_nodes": path,
-                "highlight_edges": edges,
-                "only_highlight": bool(flags.get("path_only", False)),
-            }
-            try:
-                if bool(flags.get("path_only", False)):
-                    _, fig = net.render_plot(llm_json["plot"])
-                else:
-                    _, fig = net._visualize_path(path, title=f"Fewest hops: {src} → {dst}", highlight_color="blue")
-            except Exception:
-                try:
-                    _, fig = net.render_plot(llm_json["plot"])
-                except Exception:
-                    fig = None
-
-        return llm_json, fig, node_df, (link_df if isinstance(link_df, pd.DataFrame) else pd.DataFrame())
-
-    return {"result": {"error": "NOT_IMPLEMENTED"}}, None, pd.DataFrame(), pd.DataFrame()
-
+    }
+    if flags["viz_any"] and not flags["no_plot"]:
+        out["plot"] = {
+            "title": f"Longest (≤{max_hops} hops): {src} → {dst}",
+            "highlight_nodes": best,
+            "highlight_edges": _path_edges(best),
+            "only_highlight": True,
+            "path_only": True,
+            "highlight_only": True,
+            "show_edge_labels": False,
+            "label_font_size": 7,
+        }
+        _, fig = net.render_plot(out["plot"])
+    return out, fig, pd.DataFrame([{"Nodes": best, "Hop Count": len(best) - 1, "Total Distance (km)": best_dist}]), pd.DataFrame()
 
 def _answer_graph_stats(query: str) -> Dict[str, Any]:
-    import networkx as nx
-
-    ql = (query or "").lower()
+    ql = (query or "").lower().replace("≥", ">=")
     deg = dict(net.G.degree())
     if not deg:
         return {"result": {"error": "EMPTY_TOPOLOGY"}}
@@ -432,20 +531,14 @@ def _answer_graph_stats(query: str) -> Dict[str, Any]:
 
     if "average node degree" in ql:
         vals = list(deg.values())
-        return {
-            "result": {
-                "average_degree": float(sum(vals) / len(vals)),
-                "min_degree": int(min(vals)),
-                "max_degree": int(max(vals)),
-            }
-        }
+        return {"result": {"average_degree": float(sum(vals) / len(vals)), "min_degree": int(min(vals)), "max_degree": int(max(vals))}}
 
     if "degree 1" in ql:
         return {"result": {"value": int(sum(1 for v in deg.values() if v == 1))}}
 
-    if "degree >=" in ql:
-        m = re.search(r"degree\s*>=\s*(\d+)", ql)
-        k = int(m.group(1)) if m else 3
+    m = re.search(r"degree\s*(?:>=|≥)\s*(\d+)", ql)
+    if m:
+        k = int(m.group(1))
         return {"result": {"value": int(sum(1 for v in deg.values() if v >= k))}}
 
     if "isolated" in ql:
@@ -453,198 +546,230 @@ def _answer_graph_stats(query: str) -> Dict[str, Any]:
 
     if "top 3" in ql:
         top = sorted(deg.items(), key=lambda kv: (-kv[1], str(kv[0])))[:3]
-        return {"result": {"top_nodes": [{"node_id": str(n), "degree": int(d)} for n, d in top]}}
+        return {"result": {"top3": [{"node_id": str(n), "degree": int(d)} for n, d in top]}}
 
-    if "diameter" in ql:
+    if "average shortest" in ql:
+        # hops; use largest CC if disconnected
         if nx.is_connected(net.G):
-            return {"result": {"value": int(nx.diameter(net.G))}}
-        comps = [net.G.subgraph(c).copy() for c in nx.connected_components(net.G)]
-        d = max(int(nx.diameter(g)) for g in comps if g.number_of_nodes() > 1)
-        return {"result": {"value": d}}
-
-    if "average shortest-path length" in ql:
-        if nx.is_connected(net.G):
-            return {"result": {"value": float(nx.average_shortest_path_length(net.G))}}
-        largest = max(nx.connected_components(net.G), key=len)
-        g = net.G.subgraph(largest).copy()
-        return {"result": {"value": float(nx.average_shortest_path_length(g))}}
+            asp = nx.average_shortest_path_length(net.G)
+            return {"result": {"average_shortest_path_length_hops": float(asp)}}
+        comps = sorted(nx.connected_components(net.G), key=len, reverse=True)
+        g = net.G.subgraph(comps[0]).copy()
+        asp = nx.average_shortest_path_length(g)
+        return {"result": {"average_shortest_path_length_hops": float(asp), "note": "Graph disconnected; computed on largest connected component."}}
 
     return {"result": {"error": "NOT_IMPLEMENTED"}}
 
-
-def _answer_link_stats(query: str, flags: Dict[str, bool]) -> Dict[str, Any]:
-    ql = (query or "").lower()
+def _answer_link_stats(query: str, flags: Dict[str, bool]) -> Tuple[Dict[str, Any], Any, pd.DataFrame]:
+    ql = (query or "").lower().replace("≥", ">=")
     df = _edges_df()
+    df["distance_km"] = pd.to_numeric(df["distance_km"], errors="coerce")
+    fig = None
 
     m = re.search(r"\b(ml|al)\s+links\s+under\s+(\d+(?:\.\d+)?)\s*km\b", ql)
     if m:
-        typ = m.group(1).upper()
+        lt = m.group(1).upper()
         th = float(m.group(2))
-        f = df[
-            (df["type"].astype(str).str.upper() == typ)
-            & (pd.to_numeric(df["distance_km"], errors="coerce") < th)
-        ]
-        rows = (
-            f[["u", "v", "link_id", "type", "distance_km"]]
-            .sort_values("distance_km")
-            .to_dict("records")
-        )
-        return {
-            "result": {"value": int(len(rows))},
-            "tables": [{"name": f"{typ}_links_under_{th}_km", "rows": rows}],
-        }
+        sub = df[df["type"].str.upper().eq(lt) & (df["distance_km"] <= th)].copy()
+        out = {"result": {"count": int(len(sub))}, "tables": {"links": sub[["u","v","link_id","distance_km","type"]].to_dict(orient="records")}}
+        return out, None, sub
 
-    m = re.search(r"\baverage\s+(ml|al)\s+link\s+distance\b", ql)
+    m = re.search(r"\baverage\s+(ml|al)\b.*\bdistance\b", ql)
     if m:
-        typ = m.group(1).upper()
-        f = df[df["type"].astype(str).str.upper() == typ]
-        vals = pd.to_numeric(f["distance_km"], errors="coerce").dropna()
-        return {"result": {"value": float(vals.mean()) if len(vals) else None}}
+        lt = m.group(1).upper()
+        sub = df[df["type"].str.upper().eq(lt)]
+        if sub.empty:
+            return {"result": {"value": 0, "note": f"No {lt} links found in the CSV topology."}}, None, pd.DataFrame()
+        avg_val = sub["distance_km"].mean()
+        if pd.isna(avg_val):
+            return {"result": {"value": 0, "note": f"No {lt} links found in the CSV topology."}}, None, pd.DataFrame()
+        return {"result": {"value": float(avg_val)}}, None, sub
 
-    if "maximum ml link distance" in ql or ("max" in ql and "ml" in ql and "distance" in ql):
-        f = df[df["type"].astype(str).str.upper() == "ML"].copy()
-        f["distance_km"] = pd.to_numeric(f["distance_km"], errors="coerce")
-        f = f.dropna(subset=["distance_km"])
-        if f.empty:
-            return {"result": {"error": "NO_ML_EDGES"}}
-        row = f.sort_values("distance_km", ascending=False).iloc[0].to_dict()
-        out: Dict[str, Any] = {"result": row}
-        if flags["viz_any"]:
-            out["plot"] = {
-                "title": "Max ML link",
-                "highlight_edges": [[row["u"], row["v"]]],
-                "highlight_nodes": [row["u"], row["v"]],
-            }
-        return out
+    if re.search(r"\b(max(?:imum)?\s+ml|max\s+ml)\b", ql):
+        sub = df[df["type"].str.upper().eq("ML")]
+        if sub.empty:
+            return {"result": {"value": 0, "note": "No ML links found in the CSV topology."}}, None, pd.DataFrame()
+        idx = sub["distance_km"].idxmax()
+        row = sub.loc[idx]
+        u, v = str(row["u"]), str(row["v"])
+        out = {"result": {"u": u, "v": v, "link_id": row.get("link_id"), "distance_km": float(row["distance_km"])}}
+        if flags["viz_any"] and not flags["no_plot"]:
+            out["plot"] = {"title": "Max ML link", "highlight_edges": [[u, v]], "highlight_nodes": [u, v], "only_highlight": True, "highlight_only": True, "show_edge_labels": True, "label_font_size": 7, "edge_label_font_size": 7}
+            _, fig = net.render_plot(out["plot"])
+        return out, fig, sub
 
-    if "5 longest links" in ql:
-        f = df.copy()
-        f["distance_km"] = pd.to_numeric(f["distance_km"], errors="coerce")
-        f = f.dropna(subset=["distance_km"])
-        top = f.sort_values("distance_km", ascending=False).head(5)[
-            ["u", "v", "link_id", "type", "distance_km"]
-        ]
-        rows = top.to_dict("records")
-        return {
-            "result": {"value": int(len(rows))},
-            "tables": [{"name": "top_5_longest_links", "rows": rows}],
-        }
+    m = re.search(r"\b(\d+)\s+longest\s+links\b", ql)
+    if m:
+        k = int(m.group(1))
+        sub = df.dropna(subset=["distance_km"]).sort_values("distance_km", ascending=False).head(k)
+        return {"result": {"k": k, "links": sub[["u","v","link_id","distance_km","type"]].to_dict(orient="records")}}, None, sub
 
-    return {"result": {"error": "NOT_IMPLEMENTED"}}
+    if "5 longest links" in ql or ("longest links" in ql and "5" in ql):
+        sub = df.dropna(subset=["distance_km"]).sort_values("distance_km", ascending=False).head(5)
+        return {"result": {"k": 5, "links": sub[["u","v","link_id","distance_km","type"]].to_dict(orient="records")}}, None, sub
 
+    return {"result": {"error": "NOT_IMPLEMENTED"}}, None, pd.DataFrame()
 
-def _answer_equipment(query: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame]:
-    ql = (query or "").lower()
+def _answer_equipment(query: str) -> Tuple[Dict[str, Any], Any, pd.DataFrame, pd.DataFrame]:
+    _ensure_equipment()
+    ql = (query or "").lower().replace("≥", ">=")
 
-    eqp_mngr.deploy_equipment()
-    s = eqp_mngr.summarize_equipment(visualize=False)
-    node_df = s.get("node_df")
-    link_df = s.get("link_df")
+    # summary table (only when explicitly asked)
+    if "summary" in ql or "show a summary" in ql:
+        summary = eqp_mngr.summarize_equipment(visualize=False)
+        return {"result": {"value": "EQUIPMENT_READY"}}, None, summary.get("node_df", pd.DataFrame()), summary.get("link_df", pd.DataFrame())
 
-    if not isinstance(node_df, pd.DataFrame):
-        node_df = pd.DataFrame()
-    if not isinstance(link_df, pd.DataFrame):
-        link_df = pd.DataFrame()
+    # counts
+    if "how many roadm" in ql or "roadms" in ql:
+        n = sum(1 for _, d in net.G.nodes(data=True) for e in (d.get("equipment_list") or []) if str(e).startswith("ROADM_"))
+        return {"result": {"value": int(n)}}, None, pd.DataFrame(), pd.DataFrame()
 
-    def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-        cols = [c for c in df.columns]
-        for cand in candidates:
-            for c in cols:
-                if cand in c.lower():
-                    return c
-        return None
+    if "how many trx" in ql or "trx" in ql:
+        n = sum(1 for _, d in net.G.nodes(data=True) for e in (d.get("equipment_list") or []) if str(e).startswith("TRx_"))
+        return {"result": {"value": int(n)}}, None, pd.DataFrame(), pd.DataFrame()
 
-    node_eq_col = _find_col(node_df, ["equipment", "elements", "deployed"])
-    link_eq_col = _find_col(link_df, ["equipment", "elements", "deployed"])
+    if "total number of ilas" in ql or "count the total number of ilas" in ql:
+        total = int(sum(int(d.get("ila_count", 0) or 0) for _, _, d in net.G.edges(data=True)))
+        return {"result": {"value": total}}, None, pd.DataFrame(), pd.DataFrame()
 
-    # Always return proper tables for "summary table" requests
-    if "summary table" in ql or ("deploy network equipment" in ql and "table" in ql):
-        return (
-            {
-                "result": {"value": "EQUIPMENT_DEPLOYED"},
-                "tables": [
-                    {"name": "node_equipment", "rows": node_df.to_dict("records")},
-                    {"name": "link_equipment", "rows": link_df.to_dict("records")},
-                ],
-            },
-            node_df,
-            link_df,
-        )
-
-    if "how many roadm" in ql:
-        if node_eq_col is None:
-            return ({"result": {"error": "NO_NODE_EQUIPMENT_COLUMN"}}, node_df, link_df)
-        cnt = int(
-            node_df[node_eq_col]
-            .astype(str)
-            .str.contains("ROADM", case=False, na=False)
-            .sum()
-        )
-        return ({"result": {"value": cnt}}, node_df, link_df)
-
-    if "how many trx" in ql or "trx elements" in ql:
-        if node_eq_col is None:
-            return ({"result": {"error": "NO_NODE_EQUIPMENT_COLUMN"}}, node_df, link_df)
-        cnt = int(
-            node_df[node_eq_col]
-            .astype(str)
-            .str.contains("TRX|TRANSCEIVER", case=False, na=False, regex=True)
-            .sum()
-        )
-        return ({"result": {"value": cnt}}, node_df, link_df)
-
-    if "total number of ilas" in ql or "total number of ila" in ql:
-        if link_eq_col is None:
-            return ({"result": {"error": "NO_LINK_EQUIPMENT_COLUMN"}}, node_df, link_df)
-        cnt = int(link_df[link_eq_col].astype(str).str.count("ILA").sum())
-        return ({"result": {"value": cnt}}, node_df, link_df)
-
-    def _links_with(token: str, table_name: str) -> Dict[str, Any]:
-        if link_eq_col is None:
-            return {"result": {"error": "NO_LINK_EQUIPMENT_COLUMN"}}
-        f = link_df[
-            link_df[link_eq_col].astype(str).str.contains(token, case=False, na=False)
-        ].copy()
-        rows = f.to_dict("records")
-        return {"result": {"value": int(len(rows))}, "tables": [{"name": table_name, "rows": rows}]}
+    def _links_with(prefix: str) -> List[Dict[str, Any]]:
+        rows = []
+        for u, v, d in net.G.edges(data=True):
+            eqs = d.get("equipment_list") or []
+            if isinstance(eqs, str):
+                eqs = [x.strip() for x in eqs.split("|") if x.strip()]
+            if any(str(e).startswith(prefix) for e in eqs):
+                rows.append({"u": str(u), "v": str(v), "equipment": " | ".join(map(str, eqs))})
+        return rows
 
     if "links that have an ila" in ql:
-        return (_links_with("ILA", "links_with_ila"), node_df, link_df)
+        rows = _links_with("ILA_")
+        return {"result": {"count": len(rows)}, "tables": {"links": rows}}, None, pd.DataFrame(), pd.DataFrame()
 
     if "links that have a preamp" in ql:
-        return (_links_with("PREAMP", "links_with_preamp"), node_df, link_df)
+        rows = _links_with("PreAmp_")
+        return {"result": {"count": len(rows)}, "tables": {"links": rows}}, None, pd.DataFrame(), pd.DataFrame()
 
-    if "links that have an amp" in ql:
-        if link_eq_col is None:
-            return ({"result": {"error": "NO_LINK_EQUIPMENT_COLUMN"}}, node_df, link_df)
-        f = link_df[
-            link_df[link_eq_col].astype(str).str.contains("AMP", case=False, na=False)
-            & ~link_df[link_eq_col].astype(str).str.contains("PREAMP", case=False, na=False)
-        ].copy()
-        rows = f.to_dict("records")
-        return (
-            {"result": {"value": int(len(rows))}, "tables": [{"name": "links_with_amp", "rows": rows}]},
-            node_df,
-            link_df,
-        )
+    if "links that have an amp" in ql and "preamp" not in ql:
+        rows = _links_with("Amp_")
+        return {"result": {"count": len(rows)}, "tables": {"links": rows}}, None, pd.DataFrame(), pd.DataFrame()
 
-    # Default: still return tables so downstream app/bench can display them
-    return (
-        {
-            "result": {"value": "EQUIPMENT_DEPLOYED"},
-            "tables": [
-                {"name": "node_equipment", "rows": node_df.to_dict("records")},
-                {"name": "link_equipment", "rows": link_df.to_dict("records")},
-            ],
-        },
-        node_df,
-        link_df,
-    )
+    return {"result": {"value": "EQUIPMENT_READY"}}, None, pd.DataFrame(), pd.DataFrame()
 
+def _answer_propagation_delay(query: str, flags: Dict[str, bool]) -> Tuple[Dict[str, Any], Any]:
+    src, dst = extract_src_dst(query)
+    if not src or not dst:
+        return {"result": {"error": "NO_PATH", "message": "Could not extract SRC/DST from query."}}, None
+    a, b = resolve_nodes(net.G, src, dst)
+    try:
+        path = nx.dijkstra_path(net.G, source=a, target=b, weight="weight")
+    except Exception:
+        return {"result": {"error": "NO_PATH"}}, None
+    total_km = _path_total_distance_km(path)
+    metrics = calc_qot_metrics(total_km, fiber_type="SSMF", optical_params=None)
+    delay_ms = float(metrics.get("Total Propagation Delay (ms)", 0.0) or 0.0)
+    # Fallback: if qot_utils returns 0/null, approximate using v≈2e8 m/s (~5 µs/km => 0.005 ms/km)
+    if (delay_ms is None or delay_ms == 0.0) and total_km and total_km > 0:
+        delay_ms = float(total_km) * 0.005
+    out = {"result": {"path": path, "hop_count": len(path)-1, "total_distance_km": round(total_km,6), "propagation_delay_ms": round(delay_ms,6)}}
+    fig = None
+    if flags["viz_any"] and not flags["no_plot"]:
+        out["plot"] = {"title": f"Propagation delay path: {src} → {dst}", "highlight_nodes": path, "highlight_edges": _path_edges(path), "only_highlight": True, "path_only": True, "highlight_only": True, "show_edge_labels": False, "label_font_size": 7}
+        _, fig = net.render_plot(out["plot"])
+    return out, fig
+
+def _answer_fiber_min_delay(query: str) -> Dict[str, Any]:
+    src, dst = extract_src_dst(query)
+    if not src or not dst:
+        return {"result": {"error": "NO_PATH", "message": "Could not extract SRC/DST from query."}}
+    a, b = resolve_nodes(net.G, src, dst)
+    try:
+        path = nx.dijkstra_path(net.G, source=a, target=b, weight="weight")
+    except Exception:
+        return {"result": {"error": "NO_PATH"}}
+    total_km = _path_total_distance_km(path)
+    candidates = ["SSMF", "HCF"]
+    rows = []
+    best_ft = None
+    best_delay = None
+    for ft in candidates:
+        m = calc_qot_metrics(total_km, fiber_type=ft, optical_params=None)
+        d = float(m.get("Total Propagation Delay (ms)", 0.0) or 0.0)
+        if (d is None or d == 0.0) and total_km and total_km > 0:
+            # same baseline approximation; HCF assumed slightly faster (2% here) if qot_utils missing
+            baseline = float(total_km) * 0.005
+            d = baseline * (0.98 if ft == "HCF" else 1.0)
+        rows.append({"fiber_type": ft, "propagation_delay_ms": round(d,6)})
+        if best_delay is None or d < best_delay:
+            best_delay = d
+            best_ft = ft
+    return {"result": {"src": src, "dst": dst, "total_distance_km": round(total_km,6), "best_fiber_type": best_ft, "best_propagation_delay_ms": round(float(best_delay or 0.0),6)}, "tables": {"fiber_delay_comparison": rows}}
+
+def _answer_hcf_upgrade(query: str) -> Dict[str, Any]:
+    ql = (query or "").lower()
+    m = re.search(r"\bonly\s+(\d+)\s+links\b", ql)
+    k = int(m.group(1)) if m else 2
+    df = _edges_df().dropna(subset=["distance_km"]).sort_values("distance_km", ascending=False).head(k)
+    links = df[["u","v","link_id","distance_km","type"]].to_dict(orient="records")
+    return {"result": {"k": k, "recommended_links": links, "note": "Heuristic: upgrade the longest-distance links to HCF for maximum delay reduction (uniform traffic assumption)."}}
+
+def _answer_min_ila_route(query: str, flags: Dict[str, bool]) -> Tuple[Dict[str, Any], Any]:
+    _ensure_equipment()
+    src, dst = extract_src_dst(query)
+    if not src or not dst:
+        return {"result": {"error": "NO_PATH"}}, None
+    a, b = resolve_nodes(net.G, src, dst)
+
+    # Dijkstra with ila_count weights
+    def w(u, v, d):
+        try:
+            return float(d.get("ila_count", 0) or 0)
+        except Exception:
+            return 0.0
+    try:
+        path = nx.dijkstra_path(net.G, source=a, target=b, weight=w)
+    except Exception:
+        return {"result": {"error": "NO_PATH"}}, None
+
+    total_ilas = 0
+    for u, v in zip(path, path[1:]):
+        total_ilas += int((net.G.get_edge_data(u, v) or {}).get("ila_count", 0) or 0)
+
+    out = {"result": {"path": path, "total_ilas": int(total_ilas), "hop_count": len(path)-1, "total_distance_km": round(_path_total_distance_km(path),6)}}
+    fig = None
+    if flags["viz_any"] and not flags["no_plot"]:
+        out["plot"] = {"title": f"Min-ILA path: {src} → {dst}", "highlight_nodes": path, "highlight_edges": _path_edges(path), "only_highlight": True, "path_only": True, "highlight_only": True, "show_edge_labels": False, "label_font_size": 7}
+        _, fig = net.render_plot(out["plot"])
+    return out, fig
+
+def _answer_paths_with_ila_threshold(query: str) -> Dict[str, Any]:
+    _ensure_equipment()
+    src, dst = extract_src_dst(query)
+    if not src or not dst:
+        return {"result": {"error": "NO_PATH"}}
+    a, b = resolve_nodes(net.G, src, dst)
+    ql = (query or "").lower().replace("≥", ">=")
+    m = re.search(r"\b(?:ilas|ila)\s*(?:>=|≥)\s*(\d+)\b", ql)
+    th = int(m.group(1)) if m else 4
+
+    max_hops = _parse_max_hops(query) or 12
+    paths = []
+    for p in nx.all_simple_paths(net.G, source=a, target=b, cutoff=max_hops):
+        p = list(p)
+        # path qualifies if any edge has ila_count >= th
+        qualifies = False
+        for u, v in zip(p, p[1:]):
+            ila = int((net.G.get_edge_data(u, v) or {}).get("ila_count", 0) or 0)
+            if ila >= th:
+                qualifies = True
+                break
+        if qualifies:
+            paths.append(p)
+
+    return {"result": {"src": src, "dst": dst, "threshold": th, "max_hops": max_hops, "count": len(paths), "paths": paths}}
 
 # ------------------------------ LLM fallback prompt ------------------------------
-_SYSTEM_PROMPT = """
-    You are an assistant for optical network analytics.
+_SYSTEM_PROMPT = """You are an assistant for optical network analytics.
 
 OUTPUT FORMAT (HARD RULE):
 - Return exactly ONE valid JSON object.
@@ -655,127 +780,115 @@ OUTPUT FORMAT (HARD RULE):
 FAIL-INSTEAD-OF-GUESS (HARD RULE):
 - If you cannot answer exactly from the provided payload, return:
   { "result": { "error": "NOT_IMPLEMENTED" } }
-
-INTERPRETATION PRIORITY (HARD RULE):
-- If the user asks for "shortest path" or "longest path", you MUST produce a path result (or NOT_IMPLEMENTED).
-- If the user also asks to plot, you MUST provide a plot that matches the requested scope.
-
-PLOT CONTRACT:
-- The plot object must be:
-  { "plot": { "title": "...", "highlight_edges": "ALL" or [[u,v],...], "highlight_nodes": "ALL" or [..] } }
-- Do NOT include raw topology data inside plot.
-
-PATH-ONLY VISUALIZATION RULE (HARD RULE):
-- If the user says ANY of: "plot that path only", "only the path", "not the full topology", "do not show full topology",
-  then you MUST NOT use "ALL" for highlight_edges or highlight_nodes.
-- Instead, highlight_edges MUST be an explicit edge list [[u,v], ...] for the chosen path.
-- highlight_nodes MUST be the ordered node list of the chosen path.
-
-TOPOLOGY VISUALIZATION RULE:
-- Use "ALL" ONLY when the user explicitly asks for full topology / entire network / full graph / all links.
-
-DEFAULT TITLE RULES:
-- If shortest path: title = "Shortest Path: <SRC> → <DST>"
-- If longest path:  title = "Longest Path: <SRC> → <DST>"
-- If full topology: title = "Network topology"
 """
 
+def _llm_fallback(query: str) -> Tuple[Dict[str, Any], str, Optional[int], Optional[int], Optional[int]]:
+    messages = [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": query}]
+    raw, pt, ct, tt = call_llm(messages)
+    try:
+        js = _extract_first_json(raw)
+    except Exception:
+        js = {"result": {"error": "NOT_IMPLEMENTED"}}
+    return js, raw, pt, ct, tt
 
-def build_messages(query: str) -> List[Dict[str, str]]:
-    payload = {
-        "user_query": query,
-        "topology": net.topology_snapshot(),
-        "note": "Prefer returning NOT_IMPLEMENTED rather than guessing.",
-    }
-    return [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": json.dumps(payload)}]
-
-
-# ------------------------------------ run() ------------------------------------
-def run(query: str, mode: str = "none", rag_enabled: bool = False) -> Dict[str, Any]:
-    global _TOPO_READY
-
-    if not _TOPO_READY:
-        net.build_topology(use_csv=True, visualize=False)
-        _TOPO_READY = True
-
+# ------------------------------ Main entrypoint ------------------------------
+def run(query: str) -> Dict[str, Any]:
+    """Main entry point for Streamlit."""
     flags = _query_flags(query)
 
+    plan = llm_plan(query)  # may be None
     llm_json: Dict[str, Any] = {"result": {"error": "NOT_IMPLEMENTED"}}
     fig = None
-    node_df = link_df = qot_df = None
-    prompt_tokens = completion_tokens = total_tokens = None
-    raw = ""
-    ok = True
+    node_df = pd.DataFrame()
+    link_df = pd.DataFrame()
+    qot_df = pd.DataFrame()
 
+    def want_viz() -> bool:
+        if isinstance(plan, dict) and "visualize" in plan:
+            return bool(plan["visualize"])
+        return bool(flags.get("viz_any", False)) and not bool(flags.get("no_plot", False))
+
+    # ---------- LLM-plan dispatch ----------
     try:
-        if flags["equip"]:
-            llm_json, node_df, link_df = _answer_equipment(query)
-            raw = json.dumps(llm_json)
+        if isinstance(plan, dict):
+            intent = plan.get("intent")
 
-        elif flags["path"]:
-            llm_json, fig, node_df, link_df = _answer_paths(query, flags)
-            raw = json.dumps(llm_json)
+            if intent == "TOPOLOGY_BUILD":
+                llm_json, fig = _answer_topology({"viz_any": want_viz(), "no_plot": not want_viz(), "distance_labels": bool(flags.get("distance_labels", False))})
 
+            elif intent in {"SHORTEST_PATH","FEWEST_HOPS","LONGEST_PATH","ALL_PATHS"}:
+                src = plan.get("src")
+                dst = plan.get("dst")
+                if not src or not dst:
+                    src, dst = extract_src_dst(query)
+                key = {
+                    "SHORTEST_PATH": "shortest",
+                    "FEWEST_HOPS": "fewest hops",
+                    "LONGEST_PATH": "longest",
+                    "ALL_PATHS": "all paths",
+                }[intent]
+                q2 = f"{key} path from {src} to {dst}"
+                llm_json, fig, node_df, link_df = _answer_paths(q2, {"viz_any": want_viz(), "no_plot": not want_viz()})
 
-        elif flags["topology"]:
-            llm_json, fig = _answer_topology(flags)
-            raw = json.dumps(llm_json)
+            elif intent == "GRAPH_STATS":
+                llm_json = _answer_graph_stats(query)
 
+            elif intent == "LINK_STATS":
+                llm_json, fig, link_df = _answer_link_stats(query, {"viz_any": want_viz(), "no_plot": not want_viz()})
 
-        elif flags["graph_stats"]:
-            llm_json = _answer_graph_stats(query)
-            raw = json.dumps(llm_json)
+            elif intent == "EQUIPMENT":
+                llm_json, fig, node_df, link_df = _answer_equipment(query)
 
-        elif flags["link_stats"]:
-            llm_json = _answer_link_stats(query, flags)
-            raw = json.dumps(llm_json)
+            elif intent == "PROP_DELAY":
+                llm_json, fig = _answer_propagation_delay(query, {"viz_any": want_viz(), "no_plot": not want_viz()})
 
-        else:
-            messages = build_messages(query)
-            raw, prompt_tokens, completion_tokens, total_tokens = call_llm(messages)
-            llm_json = _extract_first_json(raw)
+            elif intent == "FIBER_CHOICE":
+                llm_json = _answer_fiber_min_delay(query)
 
-    except Exception as e:
-        ok = False
-        llm_json = {"result": {"error": "PARSE_ERROR", "message": str(e), "raw": (raw or "")[:2000]}}
-        raw = json.dumps(llm_json)
+            elif intent == "HCF_UPGRADE":
+                llm_json = _answer_hcf_upgrade(query)
 
-    # If we didn't already compute fig directly, render via plot spec
-    if fig is None:
-        plot = llm_json.get("plot") if isinstance(llm_json, dict) else None
-        if isinstance(plot, dict):
-            try:
-                _, fig = net.render_plot(plot)
-            except Exception:
-                fig = None
+            elif intent == "ILA_MIN_ROUTE":
+                llm_json, fig = _answer_min_ila_route(query, {"viz_any": want_viz(), "no_plot": not want_viz()})
 
-    # Tables into DFs (so app + benchmark can show them)
-    tables = llm_json.get("tables") if isinstance(llm_json, dict) else None
-    if isinstance(tables, list):
-        for t in tables:
-            if not isinstance(t, dict):
-                continue
-            name = str(t.get("name") or "").lower()
-            rows = t.get("rows")
-            if not isinstance(rows, list):
-                continue
-            df = pd.DataFrame(rows)
-            if any(k in name for k in ["node", "path"]):
-                node_df = df
-            elif "link" in name or "edge" in name:
-                link_df = df
-            elif "qot" in name:
-                qot_df = df
+            elif intent == "ILA_THRESH_PATHS":
+                llm_json = _answer_paths_with_ila_threshold(query)
+    except Exception:
+        # ignore and fall back
+        pass
+
+    # ---------- Deterministic fallback ----------
+    if not isinstance(llm_json, dict) or llm_json.get("result", {}).get("error") in {"NOT_IMPLEMENTED"}:
+        try:
+            if flags["topology"]:
+                llm_json, fig = _answer_topology(flags)
+            elif flags["path"]:
+                llm_json, fig, node_df, link_df = _answer_paths(query, flags)
+            elif flags["graph_stats"]:
+                llm_json = _answer_graph_stats(query)
+            elif flags["link_stats"]:
+                llm_json, fig, link_df = _answer_link_stats(query, flags)
+            elif flags["equip"]:
+                llm_json, fig, node_df, link_df = _answer_equipment(query)
+            elif flags["delay"]:
+                llm_json, fig = _answer_propagation_delay(query, {"viz_any": want_viz(), "no_plot": not want_viz()})
+            elif flags["fiber_choice"]:
+                llm_json = _answer_fiber_min_delay(query)
+            elif flags["hcf_upgrade"]:
+                llm_json = _answer_hcf_upgrade(query)
+            elif flags["ila_min"]:
+                llm_json, fig = _answer_min_ila_route(query, {"viz_any": want_viz(), "no_plot": not want_viz()})
+            elif flags["ila_thresh"]:
+                llm_json = _answer_paths_with_ila_threshold(query)
+        except Exception as e:
+            llm_json = {"result": {"error": "EXCEPTION", "message": str(e)}}
 
     return {
-        "ok": ok and isinstance(llm_json, dict),
         "llm_json": llm_json,
         "fig": fig,
-        "node_df": node_df,
-        "link_df": link_df,
-        "qot_df": qot_df,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "raw": raw,
+        "node_df": node_df if isinstance(node_df, pd.DataFrame) else pd.DataFrame(),
+        "link_df": link_df if isinstance(link_df, pd.DataFrame) else pd.DataFrame(),
+        "qot_df": qot_df if isinstance(qot_df, pd.DataFrame) else pd.DataFrame(),
+        "raw": json.dumps(llm_json, indent=2),
     }
+

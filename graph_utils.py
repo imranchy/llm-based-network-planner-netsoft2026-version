@@ -4,7 +4,10 @@ import os
 from functools import wraps
 import networkx as nx
 import matplotlib.pyplot as plt
-import streamlit as st
+try:
+    import streamlit as st  # type: ignore
+except Exception:  # allow non-UI usage
+    st = None  # type: ignore
 
 
 # ----------------- Utility Functions -----------------
@@ -47,24 +50,61 @@ def interactive_plot(func):
 # ----------------- Node Resolver -----------------
 def resolve_nodes(G, src, dst):
     """
-    Safely resolve source and destination nodes, ensuring both exist in the graph.
-    """
-    src = str(src).strip() if src is not None else None
-    dst = str(dst).strip() if dst is not None else None
+    Resolve source and destination nodes robustly.
 
-    if src is None or dst is None:
+    Supports:
+    - exact match
+    - case-insensitive exact match
+    - 3-letter city code match (e.g., BER -> Berlin) when unambiguous
+    """
+    def _norm(x):
+        return str(x).strip() if x is not None else None
+
+    src = _norm(src)
+    dst = _norm(dst)
+    if not src or not dst:
         print("❌ Source or destination cannot be empty.")
         return None, None
 
-    if src not in G.nodes:
+    nodes = list(G.nodes)
+
+    def _resolve_one(x: str):
+        if x in G.nodes:
+            return x
+        xl = x.lower()
+
+        # Case-insensitive exact match
+        cis = [n for n in nodes if str(n).lower() == xl]
+        if len(cis) == 1:
+            return str(cis[0])
+
+        # 3-letter code match to "city-like" nodes (no separators)
+        # Only apply when query token is short (<=4) to avoid accidental matches.
+        if len(x) <= 4:
+            xup = x.upper()
+            cand = []
+            for n in nodes:
+                ns = str(n)
+                if "_" in ns or "-" in ns:
+                    continue
+                if len(ns) >= 3 and ns[:3].upper() == xup:
+                    cand.append(ns)
+            if len(cand) == 1:
+                return cand[0]
+
+        return None
+
+    rsrc = _resolve_one(src)
+    rdst = _resolve_one(dst)
+
+    if rsrc is None:
         print(f"❌ Source node '{src}' not found. Available nodes: {list(G.nodes)[:10]}...")
         return None, None
-
-    if dst not in G.nodes:
+    if rdst is None:
         print(f"❌ Destination node '{dst}' not found. Available nodes: {list(G.nodes)[:10]}...")
         return None, None
 
-    return src, dst
+    return rsrc, rdst
 
 
 # ----------------- Graph Visualization -----------------
@@ -91,7 +131,7 @@ def _visualize_graph_custom(G, pos=None, highlight_edges=None, title="Network Gr
 
     fig, ax = plt.subplots(figsize=(12, 9))
     nx.draw(G, pos, with_labels=True, node_color="skyblue",
-            node_size=900, font_size=9, ax=ax, font_weight="bold")
+            node_size=400, font_size=4, ax=ax, font_weight="bold")
     nx.draw_networkx_edges(G, pos, edge_color="gray", width=1.2, ax=ax)
 
     if highlight_edges:
@@ -109,7 +149,7 @@ def _visualize_graph_custom(G, pos=None, highlight_edges=None, title="Network Gr
             label += f" | {equipment}"
         edge_labels[(u, v)] = label
 
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, ax=ax)
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=4, ax=ax)
     ax.set_title(title)
     ax.axis("off")
 

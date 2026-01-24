@@ -1,5 +1,8 @@
 # ui_utils.py
-import streamlit as st
+try:
+    import streamlit as st  # type: ignore
+except Exception:  # allow non-UI usage
+    st = None  # type: ignore
 import time
 
 def timed(label="Operation"):

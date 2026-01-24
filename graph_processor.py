@@ -288,7 +288,7 @@ class NetworkGraph:
             path_data.append({
                 "Path #": idx,
                 "Nodes": path,
-                "Total Distance (km)": float(total_distance),
+                "Total Distance (km)": round(total_distance, 2),
                 "Hop Count": len(path) - 1
             })
 
@@ -301,7 +301,7 @@ class NetworkGraph:
                 if mode == "shortest"
                 else node_df["Total Distance (km)"].idxmax()
             )
-            best_path = node_df.loc[best_idx, "Nodes"]
+            best_path = all_paths[best_idx]
             if visualize:
                 _, fig = self._visualize_path(
                     best_path,
@@ -654,48 +654,29 @@ class NetworkGraph:
 
     # ----- Visualization helpers -----
     @interactive_plot
-    def _visualize_graph(self, highlight_edges=None, highlight_nodes=None, title="Network Graph", highlight_color="red", only_highlight: bool = False):
+    def _visualize_graph(self, highlight_edges=None, highlight_nodes=None, title="Network Graph", highlight_color="red", *, base_graph=None, pos=None, label_font_size: int = 8, edge_label_font_size: int = 8, show_edge_labels: bool = True):
         fig, ax = plt.subplots(figsize=(12, 8))
+        
+        G = base_graph if base_graph is not None else self.G
+        pos_ = pos if pos is not None else self.pos
 
-        # Optionally render only the highlighted subgraph (used for "plot path only")
-        G_to_draw = self.G
-        pos = self.pos
 
-        if only_highlight:
-            try:
-                if highlight_edges:
-                    # Preserve edge attributes (weight/link_id/type) via edge_subgraph
-                    G_to_draw = self.G.edge_subgraph(highlight_edges).copy()
-                elif highlight_nodes:
-                    G_to_draw = self.G.subgraph(highlight_nodes).copy()
-            except Exception:
-                G_to_draw = self.G
+       
 
-        # Use cached positions if available, otherwise compute for the subgraph
-        if isinstance(pos, dict) and G_to_draw is not self.G:
-            pos = {n: pos[n] for n in G_to_draw.nodes() if n in pos}
-        if not isinstance(pos, dict) or len(pos) != G_to_draw.number_of_nodes():
-            try:
-                pos = nx.spring_layout(G_to_draw, seed=42)
-            except Exception:
-                pos = nx.spring_layout(G_to_draw)
-
-        nx.draw(
-            G_to_draw,
-            pos,
-            with_labels=True,
-            node_color="lightblue",
-            font_size=8,
-            node_size=500,
-            ax=ax,
-        )
-        nx.draw_networkx_edges(G_to_draw, pos, edge_color="gray", width=1.0, ax=ax)
+        nx.draw(G, 
+                pos_, 
+                with_labels=True, 
+                node_color="lightblue",
+                font_size=label_font_size, 
+                node_size=500, 
+                ax=ax)
+        nx.draw_networkx_edges(G, pos_, edge_color="gray", width=1.0, ax=ax)
 
         # Optional highlights
         if highlight_edges:
             nx.draw_networkx_edges(
-                G_to_draw,
-                pos,
+                G,
+                pos_,
                 edgelist=highlight_edges,
                 edge_color=highlight_color,
                 width=2.5,
@@ -704,27 +685,34 @@ class NetworkGraph:
 
         if highlight_nodes:
             nx.draw_networkx_nodes(
-                G_to_draw,
-                pos,
+                G,
+                pos_,
                 nodelist=highlight_nodes,
                 node_color="orange",
                 node_size=850,
                 ax=ax,
             )
 
-        edge_labels = {
-            (u, v): f"{d.get('link_id', '')} ({d.get('weight', '?')} km)"
-            for u, v, d in G_to_draw.edges(data=True)
-        }
-        nx.draw_networkx_edge_labels(G_to_draw, pos, edge_labels=edge_labels, font_size=8, ax=ax)
+        if show_edge_labels:
+            edge_labels = {
+                (u, v): f"{d.get('link_id', '')} ({d.get('weight', '?')} km)"
+                for u, v, d in G.edges(data=True)
+            }
+            nx.draw_networkx_edge_labels(
+                G,
+                pos_,
+                edge_labels=edge_labels,
+                font_size=edge_label_font_size,
+                ax=ax,
+            )
 
         ax.set_title(title)
         ax.axis("off")
 
         info = {
             "title": title,
-            "total_nodes": self.G.number_of_nodes(),
-            "total_edges": self.G.number_of_edges(),
+            "total_nodes": G.number_of_nodes(),
+            "total_edges": G.number_of_edges(),
             "highlighted_edges_count": len(highlight_edges) if highlight_edges else 0
         }
 
@@ -734,44 +722,26 @@ class NetworkGraph:
     # Plot spec renderer (LLM-first)
     # ==========================
     @interactive_plot
-    def _visualize_path(self, path, title="Network Path", highlight_color="red", only_highlight: bool = False):
+    def _visualize_path(self, path, title="Network Path", highlight_color="red"):
         import matplotlib.pyplot as plt
         import networkx as nx
 
         fig, ax = plt.subplots(figsize=(12, 8))
 
+        nx.draw(self.G, self.pos, with_labels=True, node_color="lightblue", node_size=500, ax=ax)
+        nx.draw_networkx_edges(self.G, self.pos, edge_color="gray", width=1.0, ax=ax)
+
         path_edges = list(zip(path, path[1:]))
-
-        # Optionally draw only the path subgraph (no full topology underlay)
-        G_to_draw = self.G
-        pos = self.pos
-        if only_highlight:
-            try:
-                G_to_draw = self.G.edge_subgraph(path_edges).copy()
-            except Exception:
-                G_to_draw = self.G
-
-        if isinstance(pos, dict) and G_to_draw is not self.G:
-            pos = {n: pos[n] for n in G_to_draw.nodes() if n in pos}
-        if not isinstance(pos, dict) or len(pos) != G_to_draw.number_of_nodes():
-            try:
-                pos = nx.spring_layout(G_to_draw, seed=42)
-            except Exception:
-                pos = nx.spring_layout(G_to_draw)
-
-        nx.draw(G_to_draw, pos, with_labels=True, node_color="lightblue", node_size=500, ax=ax)
-        nx.draw_networkx_edges(G_to_draw, pos, edge_color="gray", width=1.0, ax=ax)
-
         nx.draw_networkx_edges(
-            G_to_draw, pos, edgelist=path_edges, edge_color=highlight_color, width=3.0, ax=ax
+            self.G, self.pos, edgelist=path_edges, edge_color=highlight_color, width=3.0, ax=ax
         )
-        nx.draw_networkx_nodes(G_to_draw, pos, nodelist=path, node_color="orange", node_size=800, ax=ax)
+        nx.draw_networkx_nodes(self.G, self.pos, nodelist=path, node_color="orange", node_size=800, ax=ax)
 
         edge_labels = {
             (u, v): f"{self.G[u][v].get('link_id', '')} ({self.G[u][v].get('weight', '?')} km)"
             for u, v in path_edges
         }
-        nx.draw_networkx_edge_labels(G_to_draw, pos, edge_labels=edge_labels, font_size=8, ax=ax)
+        nx.draw_networkx_edge_labels(self.G, self.pos, edge_labels=edge_labels, font_size=8, ax=ax)
 
         ax.set_title(title)
         ax.axis("off")
@@ -959,7 +929,6 @@ class NetworkGraph:
 
         title = str(plot_spec.get("title") or "Network Topology")
         highlight_color = str(plot_spec.get("highlight_color") or "red")
-        only_highlight = bool(plot_spec.get("only_highlight", False))
 
         he = plot_spec.get("highlight_edges")
         hn = plot_spec.get("highlight_nodes")
@@ -983,14 +952,52 @@ class NetworkGraph:
             highlight_nodes = [str(n) for n in self.G.nodes()]
         elif isinstance(hn, list):
             highlight_nodes = [str(n) for n in hn] if hn else None
-
-        # Always draw the base graph; highlights are optional
+        only_highlight = bool(plot_spec.get("only_highlight") or plot_spec.get("path_only") or plot_spec.get("highlight_only"))
+        show_edge_labels = bool(plot_spec.get("show_edge_labels", True))
+        label_font_size = int(plot_spec.get("label_font_size", 8) or 8)
+        edge_label_font_size = int(plot_spec.get("edge_label_font_size", 8) or 8)
+        
+        if only_highlight:
+            # Build a subgraph containing only the highlighted elements
+            import networkx as nx
+            H = nx.Graph()
+            if highlight_edges:
+                for (u, v) in highlight_edges:
+                    if self.G.has_edge(u, v):
+                        H.add_edge(u, v, **self.G.get_edge_data(u, v))
+                    elif self.G.has_edge(v, u):
+                        H.add_edge(v, u, **self.G.get_edge_data(v, u))
+                    else:
+                        # still add the edge without attrs to allow drawing
+                        H.add_edge(u, v)
+            if highlight_nodes:
+                for n in highlight_nodes:
+                    if n not in H:
+                        H.add_node(n)
+        
+            # Use stored positions when available
+            pos_sub = {n: self.pos.get(n) for n in H.nodes() if n in self.pos}
+            return self._visualize_graph(
+                highlight_edges=highlight_edges,
+                highlight_nodes=highlight_nodes,
+                title=title,
+                highlight_color=highlight_color,
+                base_graph=H,
+                pos=pos_sub if pos_sub else None,
+                label_font_size=label_font_size,
+                edge_label_font_size=edge_label_font_size,
+                show_edge_labels=show_edge_labels,
+            )
+        
+        # Default: draw full topology; highlights are optional
         return self._visualize_graph(
             highlight_edges=highlight_edges,
             highlight_nodes=highlight_nodes,
             title=title,
             highlight_color=highlight_color,
-            only_highlight=only_highlight,
+            label_font_size=label_font_size,
+            edge_label_font_size=edge_label_font_size,
+            show_edge_labels=show_edge_labels,
         )
 
 # ==========================

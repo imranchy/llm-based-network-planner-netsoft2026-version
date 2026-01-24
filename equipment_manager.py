@@ -1,4 +1,5 @@
 import pandas as pd
+import math
 from qot_utils import calc_qot_metrics
 
 class EquipmentManager:
@@ -85,12 +86,23 @@ class EquipmentManager:
             link_id = str(data.get("link_id", "")).upper()
             dist = float(data.get("weight", 0.0) or 0.0)
 
-            # Skip access links entirely
+            # Ensure fiber_type exists for delay computations
+            if not data.get("fiber_type"):
+                data["fiber_type"] = "SSMF"
+
+            # Compute and store ILA count for EVERY link (used for ILA-routing queries)
+            if ila_spacing > 0:
+                ila_count = max(0, int(math.ceil(dist / ila_spacing) - 1))
+            else:
+                ila_count = 0
+            data["ila_count"] = int(ila_count)
+
+            # Skip access links for equipment placement, but keep ila_count/fiber_type stored
             if link_id.startswith("AL"):
                 continue
 
-            # Deploy equipment only on metro links above dynamic spacing
-            if link_id.startswith("ML") and dist > ila_spacing:
+            # Deploy equipment on metro links when ILAs are needed
+            if link_id.startswith("ML") and ila_count > 0:
                 self._add_link_equipment(u, v, f"ILA_{ila_counter}")
                 self._add_link_equipment(u, v, f"Amp_{amp_counter}")
                 self._add_link_equipment(u, v, f"PreAmp_{preamp_counter}")
@@ -101,7 +113,6 @@ class EquipmentManager:
                 amp_counter += 1
                 preamp_counter += 1
                 booster_counter += 1
-
         # Update optical parameters
         self.assign_equipment_optical_params()
 
